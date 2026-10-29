@@ -1,0 +1,25 @@
+# Private payment data — never commit
+pagos/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / tooling
+.DS_Store
+.codegraph/
