@@ -3,7 +3,9 @@ name = "payments-bot"
 version = "0.1.0"
 description = "Telegram bot that reads payment receipts and keeps an append-only ledger."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic[bedrock]>=2.3.0",
+]
 
 [build-system]
 requires = ["hatchling"]
