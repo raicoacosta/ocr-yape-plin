@@ -37,7 +37,7 @@ Telegram bot (phase 3), bulk import of `pagos/` (4), EC2 deployment (5), operati
 
 - [x] T1 — Project scaffold: uv project, pytest, ruff, git repo, `.gitignore`. Route: delegated writer (bundled with T2).
 - [x] T2 — Phase 1: domain model, SQLite append-only ledger, use cases, tests. Route: delegated writer (2+ non-trivial files).
-- [ ] T3 — Phase 2a: extractor port, amount parsing, Claude-on-Bedrock adapter (unit-tested with fakes), labels template + eval script. Route: delegated writer (2+ non-trivial files).
+- [ ] T3 — Phase 2a: extractor port, amount parsing, Claude-on-Bedrock adapter (unit-tested with fakes), labels template + eval script. Route: delegated writer (2+ non-trivial files). Status: code, tests, README and all checks done; only `.env.example` pending (writer's write was denied by permission settings).
 - [ ] T4 — Phase 2b: user confirms expected amounts for the 22 images and the eval runs against Bedrock. Blocked on: user authorization of AWS profile/region and Bedrock model access.
 
 ## Acceptance criteria
@@ -72,6 +72,21 @@ Strategy: `ask-on-risk`. Forecast ≈ 950 authored lines across T1–T3 (> 400).
   - application: RED conftest `ModuleNotFoundError` → GREEN, full suite 123 passed.
 - Final checks: `uv run pytest -q` → 123 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 30 files already formatted.
 
+### T3 — extractor + eval harness (checks green; `.env.example` pending)
+
+- Dependency `anthropic[bedrock]>=2.3.0` (resolved anthropic 2.3.0, boto3/botocore 1.43.122). Real client `anthropic.AnthropicBedrockMantle(aws_region=..., aws_profile=...)`, injected so tests use fakes; the `anthropic[bedrock]` extra and `anthropic.`-prefixed model ids come from the claude-api skill (`shared/model-migration.md`, "Amazon Bedrock model IDs"). Defaults: `anthropic.claude-opus-5-5`, effort `medium`; env `AWS_REGION` (required), `AWS_PROFILE`, `EXTRACTOR_MODEL`, `EXTRACTOR_EFFORT`.
+- Layout: `ports/amount_extractor.py` (`AmountExtractor`, `Extraction`, statuses ok/unreadable/not_a_receipt/refused/failed), `adapters/extraction/{image_format,receipt_prompt,claude_bedrock}.py`, `tools/{labels,make_labels,eval_extractor}.py`.
+- Request: base64 image block (media type from magic bytes; JPEG/PNG/WebP/GIF, anything else → `failed` with no call), frozen system prompt naming the amount and its traps, `max_tokens` 16000, explicit `output_config.effort`; no `thinking`, sampling params, `tool_choice` or prefill.
+- Structured output: `output_config.format` with a closed JSON schema (`platform-availability.md`: "Structured outputs / strict tool use | Yes | Yes | Yes" for Bedrock). The amount is re-validated with `parse_amount`; non-canonical amount, missing/invalid currency, or an amount equal to the operation number → `unreadable`.
+- `stop_reason` is checked first: `refusal` → `refused` (with `stop_details.category`); any other non-`end_turn` → `failed`. SDK errors map to `failed` through a most-specific-first typed chain. AWS credential resolution errors (outside the SDK's typed errors) propagate on purpose. Refusal-fallback middleware not wired (see open questions in the T3 handoff).
+- Eval: verifies labels, image SHA-256 and settings before any call; prints a Bedrock warning (region, profile, models, request count) and exits 0 unless `--yes`; accepts `250`, `250.00`, `250,00`; reads comma- or semicolon-separated CSV (spreadsheet re-saves); writes `data/eval/results-<model>-<UTC>.csv`.
+- Test-first, two cycles, RED observed as collection errors before the modules existed:
+  - port + adapter: RED 3 collection errors (`ModuleNotFoundError: payments_bot.ports.amount_extractor`, `...adapters.extraction.claude_bedrock`) → GREEN 90 passed; suite without tools 214 passed.
+  - tools: RED 3 collection errors (`ModuleNotFoundError: payments_bot.tools.labels`, `...tools.eval_extractor`) → GREEN 39 passed.
+- Final checks: `uv run pytest -q` → 253 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 49 files already formatted; `make_labels --help` and `eval_extractor --help` → exit 0. No remote call was made; all tests are offline.
+- Work units: (1) port + Bedrock adapter, (2) labels template + eval harness + README. Size is above the ~400-line heuristic (about 1160 and 1150 authored lines, excluding `uv.lock`; over half of it tests); each commit is one coherent behavior.
+- Pending: `.env.example` listing `AWS_REGION=` with `AWS_PROFILE`, `EXTRACTOR_MODEL`, `EXTRACTOR_EFFORT` commented out (an empty `AWS_PROFILE` would reach the AWS SDK).
+
 ## Next step
 
-T3 — extractor port, amount parsing, Claude-on-Bedrock adapter (fakes only, no remote calls), labels template + eval script.
+Create `.env.example` and check T3. Then T4 — user fills data/eval/labels.csv and authorizes AWS profile/region; run eval.
