@@ -1,12 +1,13 @@
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
 from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerRepository
 from payments_bot.application.clock import Clock
 from payments_bot.application.errors import DuplicateImageError
-from payments_bot.application.payments import PaymentRegistered
+from payments_bot.application.payments import PaymentRegistered, RegisterPayment
 from payments_bot.domain.errors import InvalidEntryError
 from payments_bot.domain.ledger import EntryKind, EntrySource
 
@@ -82,5 +83,56 @@ def test_invalid_payment_writes_nothing(
 ) -> None:
     with pytest.raises(InvalidEntryError):
         register(amount_minor=0)
+
+    assert repository.history(limit=10) == []
+
+
+class _BlindToImages:
+    """A repository whose image lookup misses, like a writer that raced past the check."""
+
+    def __init__(self, repository: SqliteLedgerRepository) -> None:
+        self._repository = repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    def find_by_image_hash(self, image_sha256: str) -> None:
+        return None
+
+
+class _FailingBalance:
+    """A repository whose balance query fails after the append succeeded."""
+
+    def __init__(self, repository: SqliteLedgerRepository) -> None:
+        self._repository = repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    def balance(self) -> dict[str, int]:
+        raise RuntimeError("balance unavailable")
+
+
+def test_image_stored_after_the_check_is_still_reported_as_duplicate(
+    repository: SqliteLedgerRepository, clock: Clock, register: Register
+) -> None:
+    original = register(image_sha256=HASH_A)
+
+    with pytest.raises(DuplicateImageError) as excinfo:
+        RegisterPayment(_BlindToImages(repository), clock).execute(
+            amount_minor=4000, source=EntrySource.OCR, created_by=1, image_sha256=HASH_A
+        )
+
+    assert excinfo.value.existing_entry_id == original.entry.id
+    assert repository.history(limit=10) == [original.entry]
+
+
+def test_registration_is_undone_when_a_later_step_fails(
+    repository: SqliteLedgerRepository, clock: Clock
+) -> None:
+    with pytest.raises(RuntimeError, match="balance unavailable"):
+        RegisterPayment(_FailingBalance(repository), clock).execute(
+            amount_minor=4000, source=EntrySource.OCR, created_by=1
+        )
 
     assert repository.history(limit=10) == []

@@ -5,7 +5,7 @@ from payments_bot.application.clock import Clock, utc_now
 from payments_bot.application.errors import DuplicateImageError
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource
 from payments_bot.domain.money import DEFAULT_CURRENCY
-from payments_bot.ports.ledger_repository import LedgerRepository
+from payments_bot.ports.ledger_repository import ImageAlreadyStoredError, LedgerRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +34,11 @@ class RegisterPayment:
         paid_at: datetime | None = None,
         extracted_json: str | None = None,
     ) -> PaymentRegistered:
-        """Append a payment. A repeated image is refused; a repeated reference is flagged."""
+        """Append a payment. A repeated image is refused; a repeated reference is flagged.
+
+        The checks, the append and the resulting balance share one unit of work, so a
+        concurrent registration of the same receipt is either refused or flagged.
+        """
         entry = Entry(
             kind=EntryKind.PAYMENT,
             amount_minor=amount_minor,
@@ -48,10 +52,14 @@ class RegisterPayment:
             image_key=image_key,
             extracted_json=extracted_json,
         )
-        self._refuse_known_image(entry)
-        possible_duplicates = self._same_reference(entry)
-        saved = self.repository.append(entry)
-        return PaymentRegistered(saved, possible_duplicates, self.repository.balance())
+        with self.repository.atomic():
+            self._refuse_known_image(entry)
+            possible_duplicates = self._same_reference(entry)
+            try:
+                saved = self.repository.append(entry)
+            except ImageAlreadyStoredError as error:
+                raise DuplicateImageError(error.existing_entry_id) from error
+            return PaymentRegistered(saved, possible_duplicates, self.repository.balance())
 
     def _refuse_known_image(self, entry: Entry) -> None:
         if entry.image_sha256 is None:

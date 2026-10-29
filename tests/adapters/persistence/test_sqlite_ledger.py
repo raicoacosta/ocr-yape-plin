@@ -8,6 +8,7 @@ import pytest
 
 from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerRepository
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource, balance
+from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
 LIMA = timezone(-timedelta(hours=5))
@@ -186,13 +187,40 @@ class TestAppendOnlyEnforcement:
 
         assert repository.balance() == {"PEN": 25000}
 
-    def test_duplicate_image_hash_is_rejected(self, repository: SqliteLedgerRepository) -> None:
-        repository.append(payment(25000, image_sha256=HASH_A))
+    def test_duplicate_image_hash_is_rejected_with_the_existing_id(
+        self, repository: SqliteLedgerRepository
+    ) -> None:
+        original = repository.append(payment(25000, image_sha256=HASH_A))
 
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(ImageAlreadyStoredError) as excinfo:
             repository.append(payment(4000, image_sha256=HASH_A))
 
+        assert excinfo.value.existing_entry_id == original.id
         assert repository.balance() == {"PEN": 25000}
+
+    def test_adjustment_cannot_make_the_payment_negative(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        original = repository.append(payment(25000))
+        repository.append(adjustment(-20000, corrects_id=original.id))
+
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount negative"):
+            repository.append(adjustment(-5001, corrects_id=original.id))
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount negative"):
+            insert_raw(
+                raw,
+                kind="adjustment",
+                amount_minor=-30000,
+                currency="PEN",
+                source="manual",
+                created_by=USER_ID,
+                created_at=NOW.isoformat(),
+                corrects_id=original.id,
+                reason="overshoot",
+            )
+
+        repository.append(adjustment(-5000, corrects_id=original.id))
+        assert repository.balance() == {"PEN": 0}
 
     def test_adjustment_cannot_target_another_adjustment(
         self, repository: SqliteLedgerRepository
@@ -285,6 +313,56 @@ class TestAppendOnlyEnforcement:
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_raw(raw, **(row | overrides))
+
+
+class TestUnitOfWork:
+    def test_block_commits_when_it_completes(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        with repository.atomic():
+            repository.append(payment(25000))
+            repository.append(payment(4000))
+
+        assert raw.execute("SELECT count(*) FROM ledger_entries").fetchone() == (2,)
+
+    def test_block_writes_nothing_when_it_raises(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        with pytest.raises(RuntimeError, match="boom"), repository.atomic():
+            repository.append(payment(25000))
+            raise RuntimeError("boom")
+
+        assert repository.history(limit=10) == []
+        assert raw.execute("SELECT count(*) FROM ledger_entries").fetchone() == (0,)
+
+    def test_block_holds_the_write_lock_from_its_first_read(
+        self, db_path: Path, repository: SqliteLedgerRepository
+    ) -> None:
+        impatient = sqlite3.connect(db_path, timeout=0, autocommit=True)
+        try:
+            with repository.atomic():
+                repository.balance()
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    impatient.execute("BEGIN IMMEDIATE")
+            impatient.execute("BEGIN IMMEDIATE")
+            impatient.execute("ROLLBACK")
+        finally:
+            impatient.close()
+
+    def test_blocks_do_not_nest(self, repository: SqliteLedgerRepository) -> None:
+        with (
+            repository.atomic(),
+            pytest.raises(RuntimeError, match="nested"),
+            repository.atomic(),
+        ):
+            pass
+
+    def test_appends_outside_a_block_commit_on_their_own(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        repository.append(payment(25000))
+
+        assert raw.execute("SELECT count(*) FROM ledger_entries").fetchone() == (1,)
 
 
 class TestQueries:

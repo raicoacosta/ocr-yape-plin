@@ -1,18 +1,27 @@
 """SQLite storage for the ledger.
 
 Defense in depth: besides the domain rules, the schema itself refuses edits. UPDATE and
-DELETE abort in triggers, rows cannot be overwritten through INSERT OR REPLACE, and
-adjustments must target an existing payment in the same currency.
+DELETE abort in triggers, rows cannot be overwritten through INSERT OR REPLACE,
+adjustments must target an existing payment in the same currency, and no adjustment can
+take its payment's effective amount below zero.
+
+Transactions are explicit: the connection runs in autocommit mode, so a lone `append`
+commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... COMMIT.
 """
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource
+from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
 
 IN_MEMORY = ":memory:"
+BUSY_TIMEOUT_SECONDS = 5.0
+"""How long a writer waits for a concurrent unit of work to finish before giving up."""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -79,6 +88,21 @@ WHEN NEW.kind = 'adjustment'
 BEGIN
     SELECT RAISE(ABORT, 'adjustment must target a payment in the same currency');
 END;
+
+-- Whatever a caller computed from a stale read, an adjustment can never push its payment's
+-- effective amount (payment plus every adjustment) below zero.
+CREATE TRIGGER IF NOT EXISTS ledger_entries_effective_not_negative
+BEFORE INSERT ON ledger_entries
+WHEN NEW.kind = 'adjustment'
+    AND NEW.amount_minor + (
+        SELECT payment.amount_minor + coalesce(sum(adjustment.amount_minor), 0)
+        FROM ledger_entries AS payment
+        LEFT JOIN ledger_entries AS adjustment ON adjustment.corrects_id = payment.id
+        WHERE payment.id = NEW.corrects_id AND payment.kind = 'payment'
+    ) < 0
+BEGIN
+    SELECT RAISE(ABORT, 'adjustment would make the payment amount negative');
+END;
 """
 
 _COLUMNS = (
@@ -106,7 +130,9 @@ class SqliteLedgerRepository:
     """`LedgerRepository` backed by SQLite. It exposes no update or delete operation."""
 
     def __init__(self, database: str | Path) -> None:
-        self._connection = sqlite3.connect(database)
+        # autocommit=True: the driver never opens or commits transactions behind our back
+        # (unlike isolation_level=None, executescript() then also respects an open one).
+        self._connection = sqlite3.connect(database, autocommit=True, timeout=BUSY_TIMEOUT_SECONDS)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         if str(database) != IN_MEMORY:
@@ -116,11 +142,31 @@ class SqliteLedgerRepository:
     def close(self) -> None:
         self._connection.close()
 
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        if self._connection.in_transaction:
+            raise RuntimeError("atomic blocks cannot be nested")
+        # IMMEDIATE takes the write lock before the first read, so two units of work never
+        # decide from the same state: the second one waits (busy timeout) for the first.
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
     def append(self, entry: Entry) -> Entry:
         if entry.id is not None:
             raise ValueError(f"entry {entry.id} is already persisted")
-        with self._connection:
+        try:
             cursor = self._connection.execute(_INSERT, _to_row(entry))
+        except sqlite3.IntegrityError as error:
+            owner = self._image_owner(entry)
+            if owner is not None:
+                raise ImageAlreadyStoredError(owner) from error
+            raise
         return replace(entry, id=cursor.lastrowid)
 
     def get(self, entry_id: int) -> Entry | None:
@@ -153,6 +199,15 @@ class SqliteLedgerRepository:
         return self._fetch_all(
             "SELECT * FROM ledger_entries ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
         )
+
+    def _image_owner(self, entry: Entry) -> int | None:
+        """Id of the stored entry that already carries `entry`'s image hash, if any."""
+        if entry.image_sha256 is None:
+            return None
+        row = self._connection.execute(
+            "SELECT id FROM ledger_entries WHERE image_sha256 = ?", (entry.image_sha256,)
+        ).fetchone()
+        return row["id"] if row is not None else None
 
     def _fetch_one(self, query: str, params: tuple[object, ...]) -> Entry | None:
         row = self._connection.execute(query, params).fetchone()

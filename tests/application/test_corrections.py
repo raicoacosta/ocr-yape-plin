@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -128,3 +129,34 @@ class TestVoidEntry:
     ) -> None:
         with pytest.raises(EntryNotFoundError):
             VoidEntry(repository, clock).execute(entry_id=999, reason="gone", created_by=FIXER_ID)
+
+
+class _FailingBalance:
+    """A repository whose balance query fails after the append succeeded."""
+
+    def __init__(self, repository: SqliteLedgerRepository) -> None:
+        self._repository = repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    def balance(self) -> dict[str, int]:
+        raise RuntimeError("balance unavailable")
+
+
+@pytest.mark.parametrize("use_case", ["correct", "void"])
+def test_adjustment_is_undone_when_a_later_step_fails(
+    repository: SqliteLedgerRepository, clock: Clock, register: Register, use_case: str
+) -> None:
+    payment = register(amount_minor=25000).entry
+    failing = _FailingBalance(repository)
+
+    with pytest.raises(RuntimeError, match="balance unavailable"):
+        if use_case == "correct":
+            CorrectEntry(failing, clock).execute(
+                entry_id=payment.id, new_amount_minor=1, reason="x", created_by=FIXER_ID
+            )
+        else:
+            VoidEntry(failing, clock).execute(entry_id=payment.id, reason="x", created_by=FIXER_ID)
+
+    assert repository.history(limit=10) == [payment]
