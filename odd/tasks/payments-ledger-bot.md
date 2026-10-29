@@ -35,8 +35,8 @@ Telegram bot (phase 3), bulk import of `pagos/` (4), EC2 deployment (5), operati
 
 ## Tasks
 
-- [ ] T1 — Project scaffold: uv project, pytest, ruff, git repo, `.gitignore`. Route: delegated writer (bundled with T2).
-- [ ] T2 — Phase 1: domain model, SQLite append-only ledger, use cases, tests. Route: delegated writer (2+ non-trivial files).
+- [x] T1 — Project scaffold: uv project, pytest, ruff, git repo, `.gitignore`. Route: delegated writer (bundled with T2).
+- [x] T2 — Phase 1: domain model, SQLite append-only ledger, use cases, tests. Route: delegated writer (2+ non-trivial files).
 - [ ] T3 — Phase 2a: extractor port, amount parsing, Claude-on-Bedrock adapter (unit-tested with fakes), labels template + eval script. Route: delegated writer (2+ non-trivial files).
 - [ ] T4 — Phase 2b: user confirms expected amounts for the 22 images and the eval runs against Bedrock. Blocked on: user authorization of AWS profile/region and Bedrock model access.
 
@@ -56,8 +56,22 @@ Strategy: `ask-on-risk`. Forecast ≈ 950 authored lines across T1–T3 (> 400).
 
 ## Progress / Evidence
 
-(none yet)
+### T1 — scaffold (done)
+
+- uv project, src layout (`src/payments_bot`), hatchling backend, `requires-python >=3.12`, `.python-version` 3.13; dev deps `pytest`, `ruff` via `uv add --dev`; ruff `E,F,I,UP,B,SIM`, line-length 100; pytest `testpaths = ["tests"]`.
+- `uv run pytest -q`: 1 passed (import smoke test). `uv run ruff check .`: All checks passed.
+- RED/GREEN: no meaningful RED for a scaffold; the smoke test was written alongside the package.
+
+### T2 — append-only ledger (done)
+
+- Layout: `domain/{money,ledger,errors}.py`, `ports/ledger_repository.py` (Protocol, no update/delete), `application/{payments,corrections,queries,errors,clock}.py`, `adapters/persistence/sqlite_ledger.py`.
+- SQLite defense in depth: `STRICT` table, CHECK constraints per kind, `BEFORE UPDATE`/`BEFORE DELETE` triggers abort with `ledger is append-only`, adjustment-target trigger (must be a payment in the same currency), and a no-overwrite trigger that blocks `INSERT OR REPLACE` (which otherwise deletes rows without firing delete triggers; confirmed by dropping the trigger in a scratch run: the row was silently rewritten).
+- Test-first, three cycles, RED observed each time as collection errors (`ModuleNotFoundError`) before the module existed:
+  - domain: RED 2 collection errors → GREEN 69 passed.
+  - SQLite adapter: RED 1 collection error → GREEN 33 passed.
+  - application: RED conftest `ModuleNotFoundError` → GREEN, full suite 123 passed.
+- Final checks: `uv run pytest -q` → 123 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 30 files already formatted.
 
 ## Next step
 
-T1 + T2 via delegated writer.
+T3 — extractor port, amount parsing, Claude-on-Bedrock adapter (fakes only, no remote calls), labels template + eval script.
