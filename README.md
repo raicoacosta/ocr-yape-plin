@@ -46,6 +46,17 @@ with `uv run --env-file .env`:
 Leave optional variables unset rather than empty: an empty `AWS_PROFILE` still reaches the AWS
 SDK. The AWS account needs Bedrock access to the chosen model in that region.
 
+The Anthropic SDK also reads two variables by itself, and either one silently changes where
+receipts go or how requests are authenticated:
+
+- `ANTHROPIC_BEDROCK_MANTLE_BASE_URL` replaces the regional endpoint
+  (`https://bedrock-mantle.<region>.api.aws/anthropic`).
+- `AWS_BEARER_TOKEN_BEDROCK` (or `ANTHROPIC_AWS_API_KEY`) switches from SigV4 signing to a
+  bearer token, unless `AWS_PROFILE` is set. Even an empty value switches it.
+
+The eval prints the resolved endpoint and auth mode before anything is sent (variable names
+only, never their values).
+
 ### Evaluate it on real receipts
 
 1. Create the labels template. This is local only; nothing is sent:
@@ -57,12 +68,15 @@ SDK. The AWS account needs Bedrock access to the chosen model in that region.
    It writes `data/eval/labels.csv` with one row per image in `pagos/` and refuses to overwrite
    an existing file unless you pass `--force`.
 
-2. Open each image and type the amount it shows in `expected_amount`: `250`, `250.00` and
-   `250,00` are all accepted. Leave `expected_currency` as `PEN` unless the receipt uses another
-   currency. Rows without an amount are skipped. Do not edit `file` or `sha256`: the eval refuses
-   to score an image whose hash no longer matches.
+2. Open each image and type the transferred amount it shows in `expected_amount` (not a total
+   that adds fees): `250`, `250.00` and `250,00` are all accepted. Leave `expected_currency` as
+   `PEN` unless the receipt uses another currency. Rows without an amount are skipped. Do not
+   edit `file` or `sha256`: the eval refuses to score an image whose hash no longer matches, a
+   file listed twice, or a file name with a directory part. Keep the file UTF-8 (in a
+   spreadsheet, save as "CSV UTF-8").
 
-3. Review the plan. Without `--yes` nothing is sent:
+3. Review the plan. Without `--yes` nothing is sent. The plan shows the region, models, request
+   count, endpoint and auth mode:
 
    ```bash
    uv run --env-file .env python -m payments_bot.tools.eval_extractor \
@@ -72,6 +86,9 @@ SDK. The AWS account needs Bedrock access to the chosen model in that region.
 4. Run it by adding `--yes`. **This sends every labeled receipt image, which contains personal
    data, to Amazon Bedrock once per model, billed to your AWS account.** It prints a per-image
    table plus accuracy and token totals per model, and writes
-   `data/eval/results-<model>-<UTC time>.csv`.
+   `data/eval/results-<model>-<UTC time>-<random>.csv` one flushed row per image, so a run that
+   stops halfway (for example on an AWS credential error) keeps every answer already paid for.
+   Only `ok` answers count as matches; `needs_confirmation` rows keep their candidate amount for
+   review.
 
 `pagos/` and `data/` are git-ignored, so receipts, labels and results are never committed.

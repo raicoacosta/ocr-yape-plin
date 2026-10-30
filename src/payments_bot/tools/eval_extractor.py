@@ -3,27 +3,33 @@
     uv run python -m payments_bot.tools.eval_extractor [--model ID ...] [--yes]
 
 This SENDS every labeled receipt image to Amazon Bedrock, once per model. Without --yes it only
-prints what it would send. Every check that needs no network (labels, image hashes, settings)
-runs first, so a typo never costs a request.
+prints what it would send, including the endpoint and auth mode the SDK will use. Every check
+that needs no network (labels, image hashes, settings, results directory) runs first, so a typo
+never costs a request. Results go to data/eval/ (git-ignored) one row at a time, so a run that
+stops halfway keeps every answer already paid for.
 """
 
 import argparse
 import csv
 import os
 import re
+import secrets
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
+from typing import TextIO
 
 from payments_bot.adapters.extraction.claude_bedrock import (
     DEFAULT_EFFORT,
     DEFAULT_MODEL,
     EFFORT_LEVELS,
+    BedrockEndpoint,
     BedrockSettings,
     ExtractorConfigError,
     build_bedrock_extractor,
+    resolve_endpoint,
 )
 from payments_bot.application.clock import Clock, utc_now
 from payments_bot.ports.amount_extractor import AmountExtractor, Extraction, ExtractionStatus
@@ -39,6 +45,10 @@ from payments_bot.tools.labels import (
 )
 
 type ExtractorFactory = Callable[[BedrockSettings], AmountExtractor]
+
+DEFAULT_RESULTS_DIR = Path("data/eval")
+"""Git-ignored, like the labels and the receipts the results describe."""
+RESULT_NAME_ATTEMPTS = 5
 
 RESULT_COLUMNS = (
     "file",
@@ -116,6 +126,7 @@ class Score:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m payments_bot.tools.eval_extractor",
+        allow_abbrev=False,
         description=(
             "Score the receipt amount extractor against the hand-labeled images in the labels "
             "CSV. This SENDS each labeled receipt image to Amazon Bedrock, once per model; "
@@ -154,7 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        help="where to write results-<model>-<UTC time>.csv (default: the labels directory)",
+        default=DEFAULT_RESULTS_DIR,
+        help="where to write results-<model>-<UTC time>-<random>.csv (default: %(default)s)",
     )
     parser.add_argument(
         "--yes",
@@ -170,7 +182,9 @@ def main(
     env: Mapping[str, str] | None = None,
     extractor_factory: ExtractorFactory = build_bedrock_extractor,
     clock: Clock = utc_now,
+    new_suffix: Callable[[], str] = lambda: secrets.token_hex(3),
 ) -> int:
+    """`env` stands for the process environment, which the Bedrock client also reads itself."""
     args = build_parser().parse_args(argv)
     env = os.environ if env is None else env
     try:
@@ -183,19 +197,29 @@ def main(
             )
             return 1
         runs = resolve_settings(args, env)
+        endpoint = resolve_endpoint(runs[0], env)
+        if args.yes:
+            prepare_results_dir(args.results_dir)
     except (LabelError, SetupError, ExtractorConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    print_plan(cases, skipped=len(labels) - len(cases), runs=runs, labels_path=args.labels)
+    print_plan(
+        cases,
+        skipped=len(labels) - len(cases),
+        runs=runs,
+        endpoint=endpoint,
+        labels_path=args.labels,
+    )
     if not args.yes:
         print("Dry run: nothing was sent. Re-run with --yes to send the images.")
         return 0
 
-    results_dir = args.results_dir or args.labels.parent
     timestamp = clock().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stems = (_results_stem(settings.model, timestamp) for settings in runs)
     scores = [
-        evaluate(settings, cases, extractor_factory, results_dir, timestamp) for settings in runs
+        evaluate(settings, cases, extractor_factory, args.results_dir / stem, new_suffix)
+        for settings, stem in zip(runs, stems, strict=True)
     ]
     print("\n== summary ==")
     width = max(len(score.model) for score in scores)
@@ -236,8 +260,23 @@ def resolve_settings(args: argparse.Namespace, env: Mapping[str, str]) -> list[B
     return [replace(base, model=model) for model in models]
 
 
+def prepare_results_dir(directory: Path) -> None:
+    """Create the results directory before anything is sent, so a bad path costs nothing."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SetupError(f"cannot use {directory} for results: {exc.strerror}") from None
+    if not os.access(directory, os.W_OK):
+        raise SetupError(f"cannot write results to {directory}")
+
+
 def print_plan(
-    cases: Sequence[Case], *, skipped: int, runs: Sequence[BedrockSettings], labels_path: Path
+    cases: Sequence[Case],
+    *,
+    skipped: int,
+    runs: Sequence[BedrockSettings],
+    endpoint: BedrockEndpoint,
+    labels_path: Path,
 ) -> None:
     first = runs[0]
     profile = f"AWS profile {first.profile}" if first.profile else "default AWS credential chain"
@@ -251,42 +290,53 @@ def print_plan(
         f"{first.region} ({profile}), once per model: {models} (effort {first.effort}). "
         f"That is {_count(len(cases) * len(runs), 'request')}. Receipts contain personal data."
     )
+    print(f"Bedrock {endpoint.describe()}.")
 
 
 def evaluate(
     settings: BedrockSettings,
     cases: Sequence[Case],
     extractor_factory: ExtractorFactory,
-    results_dir: Path,
-    timestamp: str,
+    results_stem: Path,
+    new_suffix: Callable[[], str],
 ) -> Score:
+    """Score one model, writing and flushing each result row as soon as it is known."""
     extractor = extractor_factory(settings)
+    path, handle = create_results_file(results_stem, new_suffix)
     status_width = max(len(status.value) for status in ExtractionStatus)
     widths = (max(len(case.label.file) for case in cases), 10, 10, 5, status_width, 10)
     print(f"\n== {settings.model} ==")
+    print(f"results (written row by row): {path}")
     print(_table_row(TABLE_COLUMNS, widths))
     outcomes = []
-    for case in cases:
-        outcome = Outcome(case.label, extractor.extract(case.image))
-        outcomes.append(outcome)
-        print(_table_row(_table_cells(outcome), widths), flush=True)
+    with handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
+        writer.writeheader()
+        for case in cases:
+            outcome = Outcome(case.label, extractor.extract(case.image))
+            outcomes.append(outcome)
+            writer.writerow(_result_row(outcome))
+            handle.flush()
+            print(_table_row(_table_cells(outcome), widths), flush=True)
     score = Score.of(settings.model, outcomes)
-    path = write_results(results_dir, settings.model, timestamp, outcomes)
     print(score.describe())
-    print(f"results: {path}")
     return score
 
 
-def write_results(
-    results_dir: Path, model: str, timestamp: str, outcomes: Sequence[Outcome]
-) -> Path:
-    results_dir.mkdir(parents=True, exist_ok=True)
-    path = results_dir / f"results-{re.sub(r'[^A-Za-z0-9._-]', '_', model)}-{timestamp}.csv"
-    with path.open("w", encoding=CSV_ENCODING, newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(_result_row(outcome) for outcome in outcomes)
-    return path
+def create_results_file(stem: Path, new_suffix: Callable[[], str]) -> tuple[Path, TextIO]:
+    """Open a new `<stem>-<suffix>.csv` exclusively: never overwrites an earlier run's file,
+    even when two runs start in the same second."""
+    for _ in range(RESULT_NAME_ATTEMPTS):
+        path = stem.with_name(f"{stem.name}-{new_suffix()}.csv")
+        try:
+            return path, path.open("x", encoding=CSV_ENCODING, newline="")
+        except FileExistsError:
+            continue
+    raise SetupError(f"no unused results file name for {stem} after {RESULT_NAME_ATTEMPTS} tries")
+
+
+def _results_stem(model: str, timestamp: str) -> str:
+    return f"results-{re.sub(r'[^A-Za-z0-9._-]', '_', model)}-{timestamp}"
 
 
 def _result_row(outcome: Outcome) -> dict[str, str]:

@@ -86,7 +86,13 @@ def read_labels(path: Path) -> list[Label]:
         raise LabelError(
             f"{path} not found; create it with python -m payments_bot.tools.make_labels"
         )
-    text = path.read_text(encoding=CSV_ENCODING)
+    try:
+        text = path.read_text(encoding=CSV_ENCODING)
+    except UnicodeDecodeError as exc:
+        raise LabelError(
+            f"{path} is not UTF-8 (undecodable byte at offset {exc.start}); save it again as "
+            '"CSV UTF-8"'
+        ) from None
     header = text.partition("\n")[0]
     delimiter = ";" if header.count(";") > header.count(",") else ","
     reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
@@ -94,19 +100,37 @@ def read_labels(path: Path) -> list[Label]:
     if missing:
         raise LabelError(f"{path} lacks the column(s) {', '.join(missing)}")
     labels = []
+    first_line: dict[str, int] = {}
     for row in reader:
         cells = {column: (row.get(column) or "").strip() for column in LABEL_COLUMNS}
         if not any(cells.values()):
             continue
         try:
-            labels.append(_label(cells))
+            label = _label(cells)
+            if label.file in first_line:
+                raise LabelError(
+                    f"{label.file!r} is already listed on line {first_line[label.file]}; "
+                    "keep one row per image"
+                )
         except LabelError as exc:
             raise LabelError(f"{path}: line {reader.line_num}: {exc}") from None
+        first_line[label.file] = reader.line_num
+        labels.append(label)
     return labels
 
 
+def _is_bare_file_name(name: str) -> bool:
+    """A name inside the images directory: no directory part on any OS, no "." or ".."."""
+    return (
+        name not in {"", ".", ".."}
+        and "/" not in name
+        and "\\" not in name
+        and Path(name).name == name
+    )
+
+
 def _label(cells: dict[str, str]) -> Label:
-    if not cells["file"] or Path(cells["file"]).name != cells["file"]:
+    if not _is_bare_file_name(cells["file"]):
         raise LabelError(f"file {cells['file']!r} must be a bare file name")
     sha256 = cells["sha256"].lower()
     if not _SHA256_HEX.fullmatch(sha256):

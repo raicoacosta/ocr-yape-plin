@@ -1,5 +1,8 @@
 import csv
 import hashlib
+import itertools
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -73,16 +76,9 @@ class Workspace:
     labels: Path
     results: Path
 
-    def args(self, *extra: str) -> list[str]:
-        return [
-            "--labels",
-            str(self.labels),
-            "--images",
-            str(self.images),
-            "--results-dir",
-            str(self.results),
-            *extra,
-        ]
+    def args(self, *extra: str, results_dir: bool = True) -> list[str]:
+        results = ["--results-dir", str(self.results)] if results_dir else []
+        return ["--labels", str(self.labels), "--images", str(self.images), *results, *extra]
 
     def result_files(self) -> list[Path]:
         return sorted(self.results.glob("results-*.csv")) if self.results.exists() else []
@@ -108,6 +104,12 @@ def workspace(tmp_path: Path) -> Workspace:
     return Workspace(images=images, labels=labels, results=tmp_path / "results")
 
 
+def counting_suffixes() -> Callable[[], str]:
+    """Deterministic result-file suffixes: 000001, 000002, ..."""
+    numbers = itertools.count(1)
+    return lambda: f"{next(numbers):06d}"
+
+
 def run(
     workspace: Workspace,
     *extra: str,
@@ -116,7 +118,11 @@ def run(
 ) -> tuple[int, FakeFactory]:
     factory = factory or answers()
     exit_code = main(
-        workspace.args(*extra), env=env, extractor_factory=factory, clock=lambda: FIXED_NOW
+        workspace.args(*extra),
+        env=env,
+        extractor_factory=factory,
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
     )
     return exit_code, factory
 
@@ -193,7 +199,7 @@ def test_results_csv_records_every_evaluated_image(workspace: Workspace) -> None
     run(workspace, "--yes")
 
     (results,) = workspace.result_files()
-    assert results.name == f"results-{OPUS}-20261029T150000Z.csv"
+    assert results.name == f"results-{OPUS}-20261029T150000Z-000001.csv"
     rows = read_rows(results)
     assert [row["file"] for row in rows] == ["a.jpeg", "b.jpeg", "c.jpeg"]
     assert [row["expected_amount"] for row in rows] == ["250.00", "40.00", "100.00"]
@@ -233,6 +239,7 @@ def test_results_csv_keeps_a_date_only_receipt_apart_from_a_timed_one(
         env=ENV,
         extractor_factory=lambda settings: DatedExtractor(settings.model),
         clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
     )
 
     (results,) = workspace.result_files()
@@ -252,8 +259,8 @@ def test_several_models_are_evaluated_side_by_side(
     assert exit_code == 0
     assert [settings.model for settings in factory.settings] == [OPUS, HAIKU]
     assert [path.name for path in workspace.result_files()] == [
-        f"results-{HAIKU}-20261029T150000Z.csv",
-        f"results-{OPUS}-20261029T150000Z.csv",
+        f"results-{HAIKU}-20261029T150000Z-000002.csv",
+        f"results-{OPUS}-20261029T150000Z-000001.csv",
     ]
     assert out.count("2/3 (66.7%)") >= 2
 
@@ -289,6 +296,172 @@ def test_region_profile_and_effort_flags_override_the_environment(
     out = capsys.readouterr().out
     assert "sa-east-1" in out
     assert "payments" in out
+
+
+def test_banner_shows_the_endpoint_and_auth_mode_before_anything_is_sent(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(workspace)
+
+    out = capsys.readouterr().out
+    assert "https://bedrock-mantle.us-east-1.api.aws/anthropic" in out
+    assert "SigV4 with the default AWS credential chain" in out
+
+
+def test_banner_reveals_endpoint_and_token_overrides_without_their_secrets(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = {
+        **ENV,
+        "ANTHROPIC_BEDROCK_MANTLE_BASE_URL": "https://user:s3cr3tpw@proxy.example.test/anthropic",
+        "AWS_BEARER_TOKEN_BEDROCK": "t0ken-value",
+    }
+
+    run(workspace, env=env)
+
+    out = capsys.readouterr().out
+    assert "proxy.example.test/anthropic" in out
+    assert "ANTHROPIC_BEDROCK_MANTLE_BASE_URL" in out
+    assert "bearer token from AWS_BEARER_TOKEN_BEDROCK" in out
+    assert "s3cr3tpw" not in out
+    assert "t0ken-value" not in out
+
+
+def test_a_profile_flag_signs_with_sigv4_even_with_a_bearer_token_set(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(workspace, "--profile", "payments", env={**ENV, "AWS_BEARER_TOKEN_BEDROCK": "t0ken"})
+
+    out = capsys.readouterr().out
+    assert "SigV4 with AWS profile payments" in out
+    assert "bearer" not in out
+
+
+@pytest.mark.parametrize("flag", ["--ye", "--y", "--mod=x", "--prof=payments"])
+def test_abbreviated_flags_are_rejected(workspace: Workspace, flag: str) -> None:
+    factory = answers()
+
+    with pytest.raises(SystemExit) as exit_info:
+        run(workspace, flag, factory=factory)
+
+    assert exit_info.value.code == 2
+    assert factory.settings == []
+
+
+@pytest.mark.parametrize("model", ["", "  "])
+def test_blank_model_stops_before_any_call(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str], model: str
+) -> None:
+    exit_code, factory = run(workspace, "--yes", "--model", model)
+
+    assert exit_code == 2
+    assert "model" in capsys.readouterr().err
+    assert factory.settings == []
+
+
+# --- results files --------------------------------------------------------------------
+
+
+def test_results_default_to_data_eval_under_the_working_directory(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    exit_code = main(
+        workspace.args("--yes", results_dir=False),
+        env=ENV,
+        extractor_factory=answers(),
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+
+    assert exit_code == 0
+    assert [path.name for path in (cwd / "data" / "eval").iterdir()] == [
+        f"results-{OPUS}-20261029T150000Z-000001.csv"
+    ]
+    assert list(workspace.labels.parent.glob("results-*.csv")) == []
+
+
+def test_a_second_run_never_overwrites_the_first(workspace: Workspace) -> None:
+    run(workspace, "--yes")
+    (first,) = workspace.result_files()
+    first_bytes = first.read_bytes()
+
+    run(workspace, "--yes", factory=answers(c=CORRECT_A))
+
+    assert len(workspace.result_files()) == 2
+    assert first.read_bytes() == first_bytes
+
+
+def test_default_suffix_is_random(workspace: Workspace) -> None:
+    main(workspace.args("--yes"), env=ENV, extractor_factory=answers(), clock=lambda: FIXED_NOW)
+
+    (results,) = workspace.result_files()
+    pattern = rf"results-{re.escape(OPUS)}-20261029T150000Z-[0-9a-f]{{6}}\.csv"
+    assert re.fullmatch(pattern, results.name)
+
+
+@dataclass
+class CrashingExtractor:
+    """Answers the first image, then fails the way unresolved AWS credentials do. Before
+    failing it records what the results file already holds on disk."""
+
+    model: str
+    results_dir: Path
+    on_disk_at_second_call: list[str] = field(default_factory=list)
+    calls: int = 0
+
+    def extract(self, image: bytes) -> Extraction:
+        self.calls += 1
+        if self.calls > 1:
+            for path in self.results_dir.glob("results-*.csv"):
+                self.on_disk_at_second_call.append(path.read_text(encoding="utf-8-sig"))
+            raise RuntimeError("Unable to locate AWS credentials")
+        return Extraction(
+            status=ExtractionStatus.OK, model=self.model, amount_minor=25000, currency="PEN"
+        )
+
+
+def test_results_are_written_row_by_row_so_a_crash_keeps_what_was_paid_for(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    extractors: list[CrashingExtractor] = []
+
+    def factory(settings: BedrockSettings) -> CrashingExtractor:
+        extractors.append(CrashingExtractor(settings.model, workspace.results))
+        return extractors[-1]
+
+    with pytest.raises(RuntimeError, match="credentials"):
+        main(
+            workspace.args("--yes"),
+            env=ENV,
+            extractor_factory=factory,
+            clock=lambda: FIXED_NOW,
+            new_suffix=counting_suffixes(),
+        )
+
+    (on_disk,) = extractors[0].on_disk_at_second_call
+    assert "a.jpeg" in on_disk
+    (results,) = workspace.result_files()
+    rows = read_rows(results)
+    assert [(row["file"], row["got_amount"], row["match"]) for row in rows] == [
+        ("a.jpeg", "250.00", "yes")
+    ]
+    assert str(results) in capsys.readouterr().out
+
+
+def test_unwritable_results_directory_stops_before_any_call(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace.results.write_text("a file where the results directory should be")
+
+    exit_code, factory = run(workspace, "--yes")
+
+    assert exit_code == 2
+    assert str(workspace.results) in capsys.readouterr().err
+    assert factory.settings == []
 
 
 # --- refusing to start ----------------------------------------------------------------

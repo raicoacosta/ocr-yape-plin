@@ -90,6 +90,17 @@ def test_missing_images_directory_is_an_error(
     assert "nope" in capsys.readouterr().err
 
 
+def test_abbreviated_force_flag_is_rejected(images: Path, tmp_path: Path) -> None:
+    output = tmp_path / "labels.csv"
+    output.write_text("my typed labels\n")
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--images", str(images), "--output", str(output), "--forc"])
+
+    assert exit_info.value.code == 2
+    assert output.read_text() == "my typed labels\n"
+
+
 def test_help_describes_the_tool(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         main(["--help"])

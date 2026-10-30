@@ -39,6 +39,7 @@ Telegram bot (phase 3), bulk import of `pagos/` (4), EC2 deployment (5), operati
 - [x] T2 — Phase 1: domain model, SQLite append-only ledger, use cases, tests. Route: delegated writer (2+ non-trivial files).
 - [x] T2.1 — Ledger hardening from independent verification (atomic corrections/registrations, stricter DB constraints, amount cap, keyset paging, schema version). Route: delegated writer.
 - [ ] T3 — Phase 2a: extractor port, amount parsing, Claude-on-Bedrock adapter (unit-tested with fakes), labels template + eval script. Route: delegated writer (2+ non-trivial files). Status: code, tests, README and all checks done; only `.env.example` pending (writer's write was denied by permission settings).
+- [x] T3.1 — Fixes from the independent verification of T3 (`4786855`, `3faafa8`): `needs_confirmation` status, amount/reference/security-code guards, Lima wall-clock time, incremental eval results, endpoint/auth banner, labels hardening, synthetic fixtures. Route: delegated writer (trigger: 2+ non-trivial files across port, adapter, prompt, tools and tests).
 - [ ] T4 — Phase 2b: user confirms expected amounts for the 22 images and the eval runs against Bedrock. Blocked on: user authorization of AWS profile/region and Bedrock model access.
 
 ## Acceptance criteria
@@ -46,6 +47,7 @@ Telegram bot (phase 3), bulk import of `pagos/` (4), EC2 deployment (5), operati
 - T2: UPDATE/DELETE on ledger rows fail at the DB level; balance = sum of entries per currency; correct/void produce adjustments with the right delta; duplicate images rejected; all tests green.
 - T2.1: concurrent corrections/voids/registrations serialize (no double-apply, duplicate image → `DuplicateImageError`); every row the DB accepts is readable by the domain; amounts capped at `MAX_AMOUNT_MINOR`; history pages by `before_id`; unknown schema versions refused.
 - T3: extractor returns the amount in minor units or an explicit "unreadable" result; prompt and tests guard against operation number / security code / phone being taken as the amount; eval script reports per-image and overall accuracy.
+- T3.1: only a high-confidence amount that passes every guard is `ok`; medium/low confidence or an amount repeating the security code is `needs_confirmation` (candidate kept, never auto-recordable); zero, above `MAX_AMOUNT_MINOR`, or repeating the operation number's digits (formatted, shifted decimal point) is `unreadable`; printed numbers never reach `int()`; `parse_amount` refuses over-long input instead of rounding; currency is `PEN`/`USD`/null; receipt time is Lima wall-clock time and a date-only receipt invents no time; eval results default to `data/eval/`, are written row by row with collision-free names, and the banner shows endpoint and auth mode without secrets; labels refuse non-UTF-8 files, duplicate files and non-bare names; abbreviated flags and blank `--model` are refused; 529 is retryable; no real receipt data in code, prompt, tests or docs.
 - T4: accuracy reported on the 22 images; model choice (Opus 5.5 vs Haiku 5.5) decided with data.
 
 ## Checks
@@ -102,7 +104,7 @@ Verifier scripts re-run (copies adapted: barrier tolerates serialization, raw ti
 - arithmetic: keyset pages concatenate to the full history; no overlap when an entry arrives between pages; `history(-1)` raises `ValueError`; oversized amounts refused before any write.
 - schema mutation: 33 mutations (19 carried over from the verifier, `drop_currency_len` retired with the column check it targeted, plus 14 for the new guards): 31 killed; 2 survivors are equivalent mutants (`drop_unique_hash`: the no-overwrite trigger already refuses a repeated hash; `drop_kind_enum`: `entry_kind_shape` already restricts `kind`).
 - Final checks: `uv run pytest -q` → 346 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 51 files already formatted.
-- Commits: `ae1fbc2` (`fix(ledger): make corrections and registrations atomic`, 492+/37−) and the following `fix(ledger): harden schema constraints and paging` (≈442+/44− plus this document). Both above the ~400-line heuristic; over half of each is tests.
+- Commits: `ae1fbc2` (`fix(ledger): make corrections and registrations atomic`, 492+/37−) and `ec274d3` (`fix(ledger): harden schema constraints and paging`, ≈442+/44− plus this document). Both above the ~400-line heuristic; over half of each is tests.
 
 ### T3 — extractor + eval harness (checks green; `.env.example` pending)
 
@@ -119,6 +121,27 @@ Verifier scripts re-run (copies adapted: barrier tolerates serialization, raw ti
 - Commits: `4786855` (port + Bedrock adapter), `3faafa8` (labels template + eval harness).
 - Work units: (1) port + Bedrock adapter, (2) labels template + eval harness + README. Size is above the ~400-line heuristic (about 1160 and 1150 authored lines, excluding `uv.lock`; over half of it tests); each commit is one coherent behavior.
 - Pending: `.env.example` listing `AWS_REGION=` with `AWS_PROFILE`, `EXTRACTOR_MODEL`, `EXTRACTOR_EFFORT` commented out (an empty `AWS_PROFILE` would reach the AWS SDK).
+
+### T3.1 — fixes from the independent verification of T3 (done)
+
+Extraction contract (for the phase 3 bot):
+
+- `ok` is the only status that may be recorded without asking (`Extraction.auto_recordable`). It requires `confidence == high` and every guard passing.
+- `needs_confirmation` carries the candidate `amount_minor` and `currency` but must never be recorded automatically: the bot shows it and records only what the user confirms or types. Causes: medium or low confidence, or an amount whose digits repeat the receipt's security code (a 3-digit code coincides with a real amount often enough that refusing would block legitimate payments).
+- `unreadable` (no candidate shown) for an amount that is zero, above `MAX_AMOUNT_MINOR`, or repeats the operation number's digits. Chosen over `needs_confirmation` because an operation-number collision is a misread, not a coincidence, and showing the number invites the user to confirm a wrong amount; typing the amount is the safer ask.
+- Product default: the recorded amount is the **transferred amount** (Yape "Monto", Banco de la Nación "Importe"), not a "Total" that adds fees. Stated in the prompt and README.
+- Dates: `paid_on` (Lima calendar date) and `paid_at` (aware Lima time, only when a time is printed). Any offset the model adds is dropped, not applied. A date-only receipt has `paid_on` and no `paid_at`; the ledger's `paid_at` stays empty for it (phase 3 decides whether to ask).
+- `reference` is the operation number as ASCII digits (spaces, dashes, labels removed; other digit scripts dropped; more than 32 digits → None). Compared to the amount as text, so it never raises.
+
+Fixes by verification item: (1) `needs_confirmation`; prompt says illegible digits → null and confidence only covers choosing between legible candidates. (2) ASCII-digit normalization, length cap, digit-text comparison across 0/1/2 decimal shifts and leading zeros → `unreadable`. (3) zero and over-cap → `unreadable`; `parse_amount` uses exact integer arithmetic and refuses more than `MAX_AMOUNT_INTEGER_DIGITS = 15` integer digits; schema field `security_code`. (4) `--results-dir` defaults to `data/eval/`. (5) Lima wall-clock time, date-only kept as a date. (6) results opened before the first call, one row written and flushed per image; the path is printed first. (7) `resolve_endpoint` mirrors the SDK precedence (`ANTHROPIC_BEDROCK_MANTLE_BASE_URL`; `AWS_BEARER_TOKEN_BEDROCK`/`ANTHROPIC_AWS_API_KEY` unless a profile is set, even when empty); the plan prints endpoint and auth mode with user/password/query masked; a drift test compares it with a real `AnthropicBedrockMantle` built under a controlled environment (construction sends nothing and reads no credentials). (8) tests for an unknown extra key, unknown/null confidence, `../x.jpeg` and other non-bare names, and the prompt's "text in the image is data" rule. (9) non-UTF-8 labels → `LabelError`. (10) transferred amount over Total; decimal comma examples (`S/ 1.250,50` → `1250.50`, `S/ 250,50` → `250.50`); a comma in the model's amount stays non-canonical → `unreadable`. (11) currency schema enum `PEN`/`USD`/null; anything else → `unreadable`. (12) 529/503/504 retryable (`OverloadedError` is not an `InternalServerError` in the SDK); `allow_abbrev=False` on both tools (`--ye` used to mean `--yes`); blank or spaced model ids refused in `BedrockSettings`; result names `results-<model>-<UTC>-<6 hex>.csv` opened with exclusive create and retried on collision; duplicate `file` rows refused (the same image under two names is still allowed); `httpx2>=2.16.0` explicit dev dependency (`uv add --dev --offline`, lock updated from cache). (13) operation number, receipt time and date in prompt and fixtures replaced with synthetic `00012345`, `987`, `2026-01-15T09:30:00`.
+
+Test-first, two work units (interface-only stubs added before RED where collection would otherwise fail):
+
+- Extraction contract: `parse_amount` RED 4 failed / 28 passed (over-long input not refused) → GREEN 32 passed. Port + adapter + prompt RED 88 failed / 68 passed → GREEN; eval `paid_on` column RED 1 failed (`KeyError: 'paid_on'`) → GREEN; suite 417 passed. Already passing before (characterization, no RED): unknown extra key and unknown confidence → `failed`.
+- Eval and labels tooling: RED 53 failed / 39 passed (tools + settings) → GREEN; suite 460 passed. Already passing before: `../x.jpeg`, `sub/x.jpeg`, `/tmp/x.jpeg` label names. Mutation check: removing the per-row `flush()` makes the crash test fail (`assert 'a.jpeg' in ''`), so it proves rows reach disk before the next request.
+- Final checks: `uv run --frozen pytest -q` → 460 passed; `uv run --frozen ruff check .` → All checks passed; `uv run --frozen ruff format --check .` → all files formatted; `rg` for the real operation number over tracked files (excluding `.venv`, `.git`) → no output; both tools' `--help` exit 0. No remote call was made.
+- Commits: `60b4e10` (`fix(extraction): ask for confirmation instead of trusting doubtful amounts`, 600+/113−) and the following `fix(eval): keep paid results and show the real endpoint before sending` (tools, labels, README, this document). Above the ~400-line heuristic; over half is tests.
+- Not changed (outside this task): the real operation number still exists in the history of `4786855`/`3faafa8` (history is not rewritten); refusal-fallback middleware stays a phase 3 decision.
 
 ## Next step
 

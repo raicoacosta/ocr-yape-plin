@@ -26,6 +26,7 @@ from payments_bot.tools.labels import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m payments_bot.tools.make_labels",
+        allow_abbrev=False,
         description=(
             "Write a labels CSV template (file, sha256, expected_amount, expected_currency, "
             "notes) listing every receipt image, for a person to fill in. Local only."

@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,39 @@ def test_read_labels_rejects_a_bad_currency(tmp_path: Path) -> None:
     )
 
     with pytest.raises(LabelError, match="line 2"):
+        read_labels(csv_path)
+
+
+@pytest.mark.parametrize(
+    "name", ["../x.jpeg", "..\\x.jpeg", "sub/x.jpeg", "/tmp/x.jpeg", "..", "C:\\x.jpeg"]
+)
+def test_read_labels_refuses_a_file_that_is_not_a_bare_name(tmp_path: Path, name: str) -> None:
+    csv_path = tmp_path / "labels.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows([LABEL_COLUMNS, [name, HASH_A, "250", "PEN", ""]])
+
+    with pytest.raises(LabelError, match="bare file name"):
+        read_labels(csv_path)
+
+
+def test_read_labels_refuses_a_file_listed_twice(tmp_path: Path) -> None:
+    csv_path = write(
+        tmp_path / "labels.csv",
+        ",".join(LABEL_COLUMNS) + f"\na.jpeg,{HASH_A},250,PEN,\na.jpeg,{HASH_A},40,PEN,\n",
+    )
+
+    with pytest.raises(LabelError, match=r"line 3: .*a\.jpeg.* line 2"):
+        read_labels(csv_path)
+
+
+def test_read_labels_explains_a_file_that_is_not_utf8(tmp_path: Path) -> None:
+    csv_path = write(
+        tmp_path / "labels.csv",
+        ",".join(LABEL_COLUMNS) + f"\npagó.jpeg,{HASH_A},250,PEN,\n",
+        encoding="cp1252",
+    )
+
+    with pytest.raises(LabelError, match="UTF-8"):
         read_labels(csv_path)
 
 

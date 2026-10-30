@@ -17,6 +17,7 @@ from dataclasses import dataclass, fields
 from datetime import date, datetime
 from functools import partial
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -282,6 +283,11 @@ class BedrockSettings:
 
     def __post_init__(self) -> None:
         _check_effort(self.effort)
+        if not self.model or any(char.isspace() for char in self.model):
+            raise ExtractorConfigError(
+                f"model {self.model!r} must be a Bedrock model id without spaces, e.g. "
+                f"{DEFAULT_MODEL!r}"
+            )
         if self.model.startswith("claude-"):
             raise ExtractorConfigError(
                 f"model {self.model!r} is a first-party id; Bedrock model ids take the "
@@ -302,6 +308,60 @@ class BedrockSettings:
         )
 
 
+BASE_URL_ENV = "ANTHROPIC_BEDROCK_MANTLE_BASE_URL"
+"""Replaces the regional Bedrock endpoint when set, even to an empty string."""
+
+BEARER_TOKEN_ENVS = ("AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_AWS_API_KEY")
+"""Switch auth from SigV4 to a bearer token when set (first one wins), unless a profile is."""
+
+
+@dataclass(frozen=True, slots=True)
+class BedrockEndpoint:
+    """Where requests go and how they are authenticated. Holds variable names, never secrets."""
+
+    base_url: str
+    """The endpoint, with any user, password or query string masked."""
+    base_url_from: str | None
+    """The variable that replaced the regional endpoint, or None."""
+    bearer_token_from: str | None
+    """The variable holding the bearer token; None means requests are signed with SigV4."""
+    profile: str | None
+
+    def describe(self) -> str:
+        source = f"from {self.base_url_from}" if self.base_url_from else "regional default"
+        if self.bearer_token_from is not None:
+            auth = f"bearer token from {self.bearer_token_from}"
+        elif self.profile is not None:
+            auth = f"SigV4 with AWS profile {self.profile}"
+        else:
+            auth = "SigV4 with the default AWS credential chain"
+        return f"endpoint {self.base_url or '(empty)'} ({source}); auth: {auth}"
+
+
+def resolve_endpoint(settings: BedrockSettings, env: Mapping[str, str]) -> BedrockEndpoint:
+    """The endpoint and auth mode the client from `build_bedrock_extractor` will use.
+
+    Mirrors the precedence of `anthropic.AnthropicBedrockMantle` (anthropic 2.3.0), which reads
+    `BASE_URL_ENV` and `BEARER_TOKEN_ENVS` from the process environment by itself: a profile
+    means SigV4; otherwise a bearer-token variable, even an empty one, means a bearer token;
+    otherwise SigV4 with the default AWS credential chain. A test compares this with the real
+    client so an SDK upgrade cannot silently change the answer. Pass `os.environ` as `env`.
+    """
+    base_url = env.get(BASE_URL_ENV)
+    base_url_from = BASE_URL_ENV if base_url is not None else None
+    if base_url is None:
+        base_url = f"https://bedrock-mantle.{settings.region}.api.aws/anthropic"
+    bearer_token_from = None
+    if settings.profile is None:
+        bearer_token_from = next((name for name in BEARER_TOKEN_ENVS if name in env), None)
+    return BedrockEndpoint(
+        base_url=_mask_url_secrets(base_url),
+        base_url_from=base_url_from,
+        bearer_token_from=bearer_token_from,
+        profile=settings.profile,
+    )
+
+
 def build_bedrock_extractor(
     settings: BedrockSettings,
     *,
@@ -314,6 +374,18 @@ def build_bedrock_extractor(
     return ClaudeBedrockExtractor(
         client_factory(**options), model=settings.model, effort=settings.effort
     )
+
+
+def _mask_url_secrets(url: str) -> str:
+    """Hide credentials a URL may carry (user, password, query string) before printing it."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "(unparsable URL)"
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = "***@" + netloc.rpartition("@")[2]
+    return urlunsplit((parts.scheme, netloc, parts.path, "***" if parts.query else "", ""))
 
 
 def _check_effort(effort: str) -> None:
