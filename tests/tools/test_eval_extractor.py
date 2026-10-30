@@ -1,8 +1,9 @@
 import csv
 import hashlib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -200,6 +201,46 @@ def test_results_csv_records_every_evaluated_image(workspace: Workspace) -> None
     assert [row["match"] for row in rows] == ["yes", "yes", "no"]
     assert [row["status"] for row in rows] == ["ok", "ok", "ok"]
     assert [row["input_tokens"] for row in rows] == ["1000", "1000", "1000"]
+
+
+def test_results_csv_keeps_a_date_only_receipt_apart_from_a_timed_one(
+    workspace: Workspace,
+) -> None:
+    lima = ZoneInfo("America/Lima")
+    dated = {
+        IMAGES["a.jpeg"]: (date(2026, 1, 15), datetime(2026, 1, 15, 9, 30, tzinfo=lima)),
+        IMAGES["b.jpeg"]: (date(2026, 1, 16), None),
+        IMAGES["c.jpeg"]: (None, None),
+    }
+
+    @dataclass
+    class DatedExtractor:
+        model: str
+
+        def extract(self, image: bytes) -> Extraction:
+            paid_on, paid_at = dated[image]
+            return Extraction(
+                status=ExtractionStatus.NEEDS_CONFIRMATION,
+                model=self.model,
+                amount_minor=25000,
+                currency="PEN",
+                paid_on=paid_on,
+                paid_at=paid_at,
+            )
+
+    main(
+        workspace.args("--yes"),
+        env=ENV,
+        extractor_factory=lambda settings: DatedExtractor(settings.model),
+        clock=lambda: FIXED_NOW,
+    )
+
+    (results,) = workspace.result_files()
+    rows = read_rows(results)
+    assert [row["paid_on"] for row in rows] == ["2026-01-15", "2026-01-16", ""]
+    assert [row["paid_at"] for row in rows] == ["2026-01-15T09:30:00-05:00", "", ""]
+    assert [row["status"] for row in rows] == ["needs_confirmation"] * 3
+    assert [row["match"] for row in rows] == ["no"] * 3
 
 
 def test_several_models_are_evaluated_side_by_side(

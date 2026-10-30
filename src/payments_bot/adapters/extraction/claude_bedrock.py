@@ -14,7 +14,7 @@ import base64
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
-from datetime import datetime
+from datetime import date, datetime
 from functools import partial
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -23,12 +23,13 @@ import anthropic
 
 from payments_bot.adapters.extraction.image_format import SUPPORTED_FORMATS, detect_media_type
 from payments_bot.adapters.extraction.receipt_prompt import (
+    CURRENCIES,
     RECEIPT_SCHEMA,
     SYSTEM_PROMPT,
     USER_INSTRUCTION,
 )
-from payments_bot.domain.errors import InvalidAmountError, InvalidCurrencyError
-from payments_bot.domain.money import MINOR_UNITS_PER_MAJOR, parse_amount, validate_currency
+from payments_bot.domain.errors import InvalidAmountError
+from payments_bot.domain.money import MAX_AMOUNT_MINOR, parse_amount
 from payments_bot.ports.amount_extractor import (
     Confidence,
     Extraction,
@@ -43,7 +44,20 @@ MAX_TOKENS = 16000
 """Claude Opus 5.5 always thinks, and thinking counts toward this limit."""
 
 RECEIPT_TIMEZONE = ZoneInfo("America/Lima")
-"""Receipts print local time without an offset."""
+"""Receipts print Lima wall-clock time without an offset."""
+
+MAX_PRINTED_NUMBER_DIGITS = 32
+"""Longest operation number or security code kept. Real ones are far shorter; a longer digit
+string is noise, and it could never equal an amount below `MAX_AMOUNT_MINOR` anyway."""
+
+_RETRYABLE_STATUS_ERRORS = (
+    anthropic.InternalServerError,
+    anthropic.ServiceUnavailableError,
+    anthropic.DeadlineExceededError,
+    anthropic.OverloadedError,
+)
+"""5xx answers worth retrying later, 529 "overloaded" included (it is not an
+`InternalServerError` in the SDK)."""
 
 DEFAULT_CLIENT_FACTORY = anthropic.AnthropicBedrockMantle
 
@@ -97,7 +111,7 @@ class ClaudeBedrockExtractor:
             )
         except anthropic.RateLimitError as exc:
             return self._failed(f"rate limited (retryable): {exc.message}")
-        except anthropic.InternalServerError as exc:
+        except _RETRYABLE_STATUS_ERRORS as exc:
             return self._failed(f"provider error {exc.status_code} (retryable): {exc.message}")
         except anthropic.APIStatusError as exc:
             return self._failed(f"request rejected ({exc.status_code}): {exc.message}")
@@ -159,14 +173,20 @@ class ClaudeBedrockExtractor:
     def _interpret(
         self, answer: "_ReceiptAnswer", *, raw_json: str, usage: TokenUsage | None
     ) -> Extraction:
-        reference = _clean(answer.operation_number)
+        """Turn a schema-valid answer into a status. Only a high-confidence amount that passes
+        every check is `ok`; a doubtful candidate is `needs_confirmation`; a number that cannot
+        be the amount is `unreadable`, so no candidate is shown for the user to rubber-stamp."""
+        reference = _digits(answer.operation_number)
+        paid_on, paid_at = _receipt_moment(answer.paid_at)
+        confidence = Confidence(answer.confidence)
         result = partial(
             Extraction,
             model=self._model,
             reference=reference,
-            paid_at=_receipt_time(answer.paid_at),
+            paid_on=paid_on,
+            paid_at=paid_at,
             provider=_clean(answer.provider),
-            confidence=Confidence(answer.confidence),
+            confidence=confidence,
             raw_json=raw_json,
             usage=usage,
         )
@@ -175,18 +195,34 @@ class ClaudeBedrockExtractor:
             return result(status=ExtractionStatus.NOT_A_RECEIPT)
         if answer.amount is None:
             return unreadable(error="no legible amount on the receipt")
+        shown = _excerpt(answer.amount)
         try:
             amount_minor = parse_amount(answer.amount)
         except InvalidAmountError:
-            return unreadable(error=f"amount {answer.amount!r} is not a canonical decimal")
-        if _is_operation_number(amount_minor, reference):
-            return unreadable(error=f"amount {answer.amount!r} is the operation number")
+            return unreadable(error=f"amount {shown} is not a canonical decimal amount")
+        if amount_minor == 0:
+            return unreadable(error=f"amount {shown} is zero")
+        if amount_minor > MAX_AMOUNT_MINOR:
+            return unreadable(error=f"amount {shown} is above the largest amount the ledger takes")
+        if _spells(amount_minor, reference):
+            return unreadable(error=f"amount {shown} repeats the operation number's digits")
         currency = _clean(answer.currency)
-        try:
-            validate_currency(currency or "")
-        except InvalidCurrencyError:
-            return unreadable(error=f"currency {answer.currency!r} is not an ISO 4217 code")
-        return result(status=ExtractionStatus.OK, amount_minor=amount_minor, currency=currency)
+        if currency not in CURRENCIES:
+            return unreadable(
+                error=f"currency {answer.currency!r} is not one of {', '.join(CURRENCIES)}"
+            )
+        candidate = partial(result, amount_minor=amount_minor, currency=currency)
+        if _spells(amount_minor, _digits(answer.security_code)):
+            return candidate(
+                status=ExtractionStatus.NEEDS_CONFIRMATION,
+                error=f"amount {shown} repeats the security code's digits; confirm it",
+            )
+        if confidence is not Confidence.HIGH:
+            return candidate(
+                status=ExtractionStatus.NEEDS_CONFIRMATION,
+                error=f"model confidence is {confidence}; confirm the amount",
+            )
+        return candidate(status=ExtractionStatus.OK)
 
     def _failed(
         self, error: str, *, usage: TokenUsage | None = None, raw_json: str | None = None
@@ -212,6 +248,7 @@ class _ReceiptAnswer:
     amount: str | None
     currency: str | None
     operation_number: str | None
+    security_code: str | None
     paid_at: str | None
     provider: str | None
     confidence: str
@@ -298,24 +335,57 @@ def _clean(text: str | None) -> str | None:
     return text.strip()
 
 
-def _is_operation_number(amount_minor: int, reference: str | None) -> bool:
-    """Guard against the most common misread: the operation number taken as the amount."""
-    if reference is None or not reference.isdigit():
+def _excerpt(text: str, limit: int = 40) -> str:
+    return repr(text) if len(text) <= limit else f"{text[:limit]!r}... ({len(text)} characters)"
+
+
+def _digits(text: str | None) -> str | None:
+    """The ASCII digits of a printed number: "N° 0001-2345" -> "00012345".
+
+    None when there are no digits or more than `MAX_PRINTED_NUMBER_DIGITS`. Other digit
+    scripts (superscripts, Arabic-Indic) are dropped, never converted. Never raises.
+    """
+    if text is None:
+        return None
+    digits = "".join(char for char in text if char in "0123456789")
+    if not digits or len(digits) > MAX_PRINTED_NUMBER_DIGITS:
+        return None
+    return digits
+
+
+def _spells(amount_minor: int, digits: str | None) -> bool:
+    """Whether the amount's digits are `digits` (leading zeros ignored), wherever the decimal
+    point fell: operation number 00012345 matches S/ 12345, S/ 12345.00, S/ 1234.50 and
+    S/ 123.45. Compares text, so no printed number is ever converted to an integer."""
+    if digits is None or not digits.lstrip("0"):
         return False
-    return amount_minor == int(reference) * MINOR_UNITS_PER_MAJOR
+    spellings = {str(amount_minor)}
+    for shift in (10, 100):
+        if amount_minor % shift == 0:
+            spellings.add(str(amount_minor // shift))
+    return digits.lstrip("0") in spellings
 
 
-def _receipt_time(text: str | None) -> datetime | None:
-    """Parse an ISO 8601 receipt time; a time without an offset is Lima local time."""
+def _receipt_moment(text: str | None) -> tuple[date | None, datetime | None]:
+    """The printed payment date and, when printed, its time, as Lima local time.
+
+    The receipt shows Lima wall-clock time, so any UTC offset or "Z" in the answer was added by
+    the model and is dropped, not applied. A date alone stays a date: no midnight is invented.
+    Unparsable text gives (None, None).
+    """
     if text is None or not text.strip():
-        return None
+        return None, None
+    text = text.strip()
     try:
-        moment = datetime.fromisoformat(text.strip())
+        return date.fromisoformat(text), None
     except ValueError:
-        return None
-    if moment.utcoffset() is None:
-        return moment.replace(tzinfo=RECEIPT_TIMEZONE)
-    return moment
+        pass
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None, None
+    local = moment.replace(tzinfo=RECEIPT_TIMEZONE)
+    return local.date(), local
 
 
 def _usage(response: Any) -> TokenUsage | None:

@@ -51,6 +51,7 @@ RESULT_COLUMNS = (
     "status",
     "confidence",
     "reference",
+    "paid_on",
     "paid_at",
     "provider",
     "input_tokens",
@@ -260,7 +261,8 @@ def evaluate(
     timestamp: str,
 ) -> Score:
     extractor = extractor_factory(settings)
-    widths = (max(len(case.label.file) for case in cases), 10, 10, 5, 13, 10)
+    status_width = max(len(status.value) for status in ExtractionStatus)
+    widths = (max(len(case.label.file) for case in cases), 10, 10, 5, status_width, 10)
     print(f"\n== {settings.model} ==")
     print(_table_row(TABLE_COLUMNS, widths))
     outcomes = []
@@ -301,6 +303,7 @@ def _result_row(outcome: Outcome) -> dict[str, str]:
         "status": extraction.status.value,
         "confidence": extraction.confidence.value if extraction.confidence else "",
         "reference": extraction.reference or "",
+        "paid_on": extraction.paid_on.isoformat() if extraction.paid_on else "",
         "paid_at": extraction.paid_at.isoformat() if extraction.paid_at else "",
         "provider": extraction.provider or "",
         "input_tokens": str(usage.input_tokens) if usage else "",

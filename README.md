@@ -14,14 +14,24 @@ uv run ruff check .
 `ClaudeBedrockExtractor` (`src/payments_bot/adapters/extraction/`) sends one receipt image to
 Claude on Amazon Bedrock and returns an `Extraction` with an explicit status:
 
-- `ok`: amount in céntimos (`S/ 250` → `25000`, `S/ 40.00` → `4000`), currency, operation
-  number, payment time (Lima time when the receipt shows no offset), provider and confidence.
+- `ok`: amount in céntimos (`S/ 250` → `25000`, `S/ 40.00` → `4000`), currency (`PEN` or
+  `USD`), operation number (ASCII digits), payment date (`paid_on`) and, when the receipt prints
+  one, time (`paid_at`, always read as Lima wall-clock time), provider and confidence. Only a
+  high-confidence amount that passes every check is `ok`, and `ok` is the only status that may
+  be recorded without asking.
+- `needs_confirmation`: a candidate amount and currency that must **never be recorded
+  automatically**. The model was not highly confident, or the amount repeats the receipt's
+  security code. The bot shows the candidate and records only what the user confirms.
 - `unreadable`, `not_a_receipt`, `refused` or `failed`: no amount is returned and `error` says
-  why. The extractor never guesses.
+  why. An amount that is zero, above the ledger cap, or repeats the operation number's digits is
+  `unreadable`: showing it as a candidate would invite the user to confirm a misread.
 
-The prompt names the numbers that are *not* the amount (operation number, Yape's security code,
-phone and account digits, dates, promotional banners). The answer must follow a JSON schema, and
-the amount is checked again in code before it is trusted.
+The recorded amount is the **transferred amount** (Yape "Monto", Banco de la Nación
+"Importe"), not a "Total" that adds fees. The prompt names the numbers that are *not* the amount
+(operation number, Yape's security code, phone and account digits, dates, promotional banners),
+explains decimal commas (`S/ 1.250,50` → `1250.50`), and tells the model that text inside the
+image is data, never instructions. The answer must follow a JSON schema, and the amount is
+checked again in code before it is trusted.
 
 Configuration comes from environment variables, for example a git-ignored `.env` file passed
 with `uv run --env-file .env`:

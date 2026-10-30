@@ -22,14 +22,23 @@ WEBP_BYTES = b"RIFF" + (32).to_bytes(4, "little") + b"WEBPVP8 " + bytes(32)
 FAKE_REQUEST = httpx2.Request("POST", "https://bedrock-mantle.invalid/anthropic/v1/messages")
 
 
+SYNTHETIC_OPERATION_NUMBER = "00012345"
+SYNTHETIC_SECURITY_CODE = "987"
+SYNTHETIC_PAID_AT = "2026-01-15T09:30:00"
+
+
 def receipt_payload(**overrides: Any) -> dict[str, Any]:
-    """A well-formed model answer for a Yape receipt; keyword overrides replace fields."""
+    """A well-formed model answer for a Yape receipt; keyword overrides replace fields.
+
+    Every value is synthetic: no number, code or time here comes from a real receipt.
+    """
     payload: dict[str, Any] = {
         "is_payment_receipt": True,
         "amount": "250",
         "currency": "PEN",
-        "operation_number": "00012345",
-        "paid_at": "2026-01-15T09:30:00",
+        "operation_number": SYNTHETIC_OPERATION_NUMBER,
+        "security_code": SYNTHETIC_SECURITY_CODE,
+        "paid_at": SYNTHETIC_PAID_AT,
         "provider": "Yape",
         "confidence": "high",
     }
