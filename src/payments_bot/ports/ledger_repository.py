@@ -18,7 +18,13 @@ class ImageAlreadyStoredError(Exception):
         self.existing_entry_id = existing_entry_id
 
 
+class LedgerBusyError(Exception):
+    """Another connection kept the ledger locked longer than the storage is willing to wait."""
+
+
 class LedgerRepository(Protocol):
+    """Every operation may raise `LedgerBusyError` when another writer holds the ledger."""
+
     def atomic(self) -> AbstractContextManager[None]:
         """Unit of work: what the block reads and appends commits together, or not at all.
 
@@ -52,9 +58,10 @@ class LedgerRepository(Protocol):
         ...
 
     def history(self, limit: int, before_id: int | None = None) -> list[Entry]:
-        """At most `limit` (>= 1) entries newest first, only those older than `before_id`.
+        """At most `limit` entries newest first, only those older than `before_id`.
 
         Keyset paging: pass the last id of a page as `before_id` to get the next one, which
-        stays stable when new entries arrive in between.
+        stays stable when new entries arrive in between. Both are ints from 1 to 2**63 - 1;
+        anything else raises `TypeError` (not an int, or a bool) or `ValueError`.
         """
         ...

@@ -1,5 +1,6 @@
 import sqlite3
 import sys
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from payments_bot.adapters.persistence import sqlite_ledger
 from payments_bot.adapters.persistence.sqlite_ledger import (
     SCHEMA_VERSION,
     SqliteLedgerRepository,
@@ -14,7 +16,7 @@ from payments_bot.adapters.persistence.sqlite_ledger import (
 )
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource, balance
 from payments_bot.domain.money import MAX_AMOUNT_MINOR
-from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
+from payments_bot.ports.ledger_repository import ImageAlreadyStoredError, LedgerBusyError
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
 LIMA = timezone(-timedelta(hours=5))
@@ -79,6 +81,35 @@ def insert_raw(connection: sqlite3.Connection, **columns: Any) -> None:
             f"INSERT INTO ledger_entries ({names}) VALUES ({placeholders})",
             tuple(columns.values()),
         )
+
+
+def hold_write_lock(path: Path) -> sqlite3.Connection:
+    """A connection that holds the database's write lock until it rolls back or closes."""
+    holder = sqlite3.connect(path, autocommit=True)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+def open_at_once(path: Path, openers: int) -> list[str]:
+    """Open `path` from `openers` threads released together; return each outcome."""
+    barrier = threading.Barrier(openers)
+    outcomes = ["not run"] * openers
+
+    def run(index: int) -> None:
+        barrier.wait(timeout=10)
+        try:
+            SqliteLedgerRepository(path).close()
+            outcomes[index] = "opened"
+        except Exception as error:  # noqa: BLE001 - the error is the outcome under test
+            outcomes[index] = f"{type(error).__name__}: {error}"
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(openers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    return outcomes
 
 
 @pytest.fixture
@@ -619,6 +650,86 @@ class TestSchemaVersion:
         connection.close()
 
 
+class TestBusyDatabase:
+    """Another connection holds the write lock: wait for it, then fail with a port error."""
+
+    def test_first_open_retries_while_another_connection_locks_the_new_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Switching to WAL does not wait on the busy timeout: SQLite answers "database is
+        # locked" at once to avoid a deadlock, so the opener must retry by itself.
+        new_file = tmp_path / "new.db"
+        holder = hold_write_lock(new_file)
+        pauses: list[float] = []
+
+        def release_on_first_pause(seconds: float) -> None:
+            pauses.append(seconds)
+            if holder.in_transaction:
+                holder.execute("ROLLBACK")
+
+        monkeypatch.setattr(sqlite_ledger, "sleep", release_on_first_pause)
+        try:
+            repository = SqliteLedgerRepository(new_file)
+        finally:
+            holder.close()
+
+        try:
+            assert pauses
+            assert repository.append(payment()).id == 1
+        finally:
+            repository.close()
+        check = sqlite3.connect(new_file)
+        assert check.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert check.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+        check.close()
+
+    def test_first_open_gives_up_with_ledger_busy_after_the_busy_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        new_file = tmp_path / "new.db"
+        holder = hold_write_lock(new_file)
+        try:
+            with pytest.raises(LedgerBusyError):
+                SqliteLedgerRepository(new_file, busy_timeout=0.2)
+        finally:
+            holder.close()
+
+        repository = SqliteLedgerRepository(new_file)
+        try:
+            assert repository.append(payment()).id == 1
+        finally:
+            repository.close()
+
+    def test_many_connections_opening_one_new_file_at_once_all_succeed(
+        self, tmp_path: Path
+    ) -> None:
+        for attempt in range(20):
+            new_file = tmp_path / f"new-{attempt}.db"
+
+            outcomes = open_at_once(new_file, openers=8)
+
+            assert outcomes == ["opened"] * 8, f"attempt {attempt}: {outcomes}"
+            check = sqlite3.connect(new_file)
+            assert check.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+            check.close()
+
+    def test_writes_blocked_past_the_busy_timeout_raise_ledger_busy(
+        self, db_path: Path, repository: SqliteLedgerRepository
+    ) -> None:
+        saved = repository.append(payment())
+        impatient = SqliteLedgerRepository(db_path, busy_timeout=0.1)
+        holder = hold_write_lock(db_path)
+        try:
+            with pytest.raises(LedgerBusyError):
+                impatient.append(payment(4000))
+            with pytest.raises(LedgerBusyError), impatient.atomic():
+                pass
+            assert impatient.history(limit=10) == [saved]
+        finally:
+            holder.close()
+            impatient.close()
+
+
 class TestUnitOfWork:
     def test_block_commits_when_it_completes(
         self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
@@ -714,6 +825,43 @@ class TestQueries:
 
         with pytest.raises(ValueError, match="limit"):
             repository.history(limit=limit)
+
+    @pytest.mark.parametrize(
+        ("limit", "before_id", "name"),
+        [
+            (2**63, None, "limit"),
+            (10, 0, "before_id"),
+            (10, -1, "before_id"),
+            (10, 2**63, "before_id"),
+        ],
+    )
+    def test_history_refuses_paging_values_sqlite_cannot_store(
+        self, repository: SqliteLedgerRepository, limit: int, before_id: int, name: str
+    ) -> None:
+        with pytest.raises(ValueError, match=name):
+            repository.history(limit=limit, before_id=before_id)
+
+    @pytest.mark.parametrize(
+        ("limit", "before_id", "name"),
+        [
+            (True, None, "limit"),
+            (2.0, None, "limit"),
+            (10, 2.5, "before_id"),
+            (10, True, "before_id"),
+        ],
+    )
+    def test_history_refuses_paging_values_that_are_not_ints(
+        self, repository: SqliteLedgerRepository, limit: Any, before_id: Any, name: str
+    ) -> None:
+        with pytest.raises(TypeError, match=name):
+            repository.history(limit=limit, before_id=before_id)
+
+    def test_history_accepts_the_largest_id_as_before_id(
+        self, repository: SqliteLedgerRepository
+    ) -> None:
+        saved = repository.append(payment())
+
+        assert repository.history(limit=2**63 - 1, before_id=2**63 - 1) == [saved]
 
     def test_adjustments_for_returns_only_that_payments_adjustments(
         self, repository: SqliteLedgerRepository

@@ -1,13 +1,20 @@
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerRepository
 from payments_bot.application.clock import Clock
-from payments_bot.application.corrections import CorrectEntry
+from payments_bot.application.corrections import CorrectEntry, VoidEntry
 from payments_bot.application.errors import EntryNotFoundError
 from payments_bot.application.payments import PaymentRegistered
-from payments_bot.application.queries import GetBalance, GetEntryDetail, ListHistory
+from payments_bot.application.queries import (
+    MAX_ENTRY_ID,
+    MAX_HISTORY_PAGE,
+    GetBalance,
+    GetEntryDetail,
+    ListHistory,
+)
 
 Register = Callable[..., PaymentRegistered]
 
@@ -57,9 +64,61 @@ def test_list_history_is_newest_first_and_pages_before_the_last_seen_id(
     assert [entry.id for entry in second_page] == [ids[0]]
 
 
-@pytest.mark.parametrize(("limit", "before_id"), [(0, None), (-1, None), (10, 0), (10, -1)])
+@pytest.mark.parametrize(
+    ("limit", "before_id"),
+    [
+        (0, None),
+        (-1, None),
+        (MAX_HISTORY_PAGE + 1, None),
+        (2**63, None),
+        (10, 0),
+        (10, -1),
+        (10, MAX_ENTRY_ID + 1),
+    ],
+)
 def test_list_history_rejects_invalid_paging(
     repository: SqliteLedgerRepository, limit: int, before_id: int | None
 ) -> None:
     with pytest.raises(ValueError):
         ListHistory(repository).execute(limit=limit, before_id=before_id)
+
+
+@pytest.mark.parametrize(
+    ("limit", "before_id"),
+    [(True, None), (2.0, None), ("10", None), (10, 2.5), (10, True), (10, "5")],
+)
+def test_list_history_accepts_only_int_paging_values(
+    repository: SqliteLedgerRepository, limit: Any, before_id: Any
+) -> None:
+    with pytest.raises(TypeError):
+        ListHistory(repository).execute(limit=limit, before_id=before_id)
+
+
+def test_list_history_accepts_the_largest_page_and_id(
+    repository: SqliteLedgerRepository, register: Register
+) -> None:
+    ids = [register(amount_minor=amount).entry.id for amount in (100, 200)]
+
+    page = ListHistory(repository).execute(limit=MAX_HISTORY_PAGE, before_id=MAX_ENTRY_ID)
+
+    assert [entry.id for entry in page] == ids[::-1]
+
+
+@pytest.mark.parametrize("entry_id", [0, -1, MAX_ENTRY_ID + 1])
+def test_ids_no_entry_can_have_are_not_found(
+    repository: SqliteLedgerRepository, clock: Clock, entry_id: int
+) -> None:
+    with pytest.raises(EntryNotFoundError):
+        GetEntryDetail(repository).execute(entry_id)
+    with pytest.raises(EntryNotFoundError):
+        VoidEntry(repository, clock).execute(entry_id=entry_id, reason="x", created_by=1)
+
+
+@pytest.mark.parametrize("entry_id", [True, 1.0, "1"])
+def test_entry_ids_must_be_ints(
+    repository: SqliteLedgerRepository, register: Register, entry_id: Any
+) -> None:
+    register()
+
+    with pytest.raises(TypeError):
+        GetEntryDetail(repository).execute(entry_id)

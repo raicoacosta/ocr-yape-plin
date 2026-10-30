@@ -7,6 +7,7 @@ The assertions only use invariants that hold for either ordering.
 """
 
 import contextlib
+import sqlite3
 import threading
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from payments_bot.application.payments import RegisterPayment
 from payments_bot.application.queries import GetEntryDetail
 from payments_bot.domain.errors import AlreadyVoidedError, NoChangeError
 from payments_bot.domain.ledger import EntryKind, EntrySource, balance
+from payments_bot.ports.ledger_repository import LedgerBusyError
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
 HASH_A = "a" * 64
@@ -201,3 +203,21 @@ def test_same_reference_registered_twice_at_once_is_flagged_by_the_second(
     assert first.possible_duplicates == ()
     assert second.possible_duplicates == (first.entry.id,)
     assert [entry.kind for entry in ledger.history(limit=10)] == [EntryKind.PAYMENT] * 2
+
+
+def test_use_cases_blocked_past_the_busy_timeout_raise_ledger_busy(
+    db_path: Path, ledger: SqliteLedgerRepository, payment_id: int
+) -> None:
+    impatient = SqliteLedgerRepository(db_path, busy_timeout=0.1)
+    holder = sqlite3.connect(db_path, autocommit=True)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        for job in (register(), void(payment_id), correct(payment_id, 30000)):
+            with pytest.raises(LedgerBusyError):
+                job(impatient)
+        # Reads do not wait for the writer (WAL), so queries still answer.
+        assert GetEntryDetail(impatient).execute(payment_id).effective_amount == 25000
+    finally:
+        holder.close()
+        impatient.close()
+    assert ledger.balance() == {"PEN": 29000}

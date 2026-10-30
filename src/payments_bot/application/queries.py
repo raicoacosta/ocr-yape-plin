@@ -4,6 +4,11 @@ from payments_bot.application.errors import EntryNotFoundError
 from payments_bot.domain.ledger import Entry, effective_amount
 from payments_bot.ports.ledger_repository import LedgerRepository
 
+MAX_HISTORY_PAGE = 500
+"""Most entries `ListHistory` returns at once; a larger page is refused, not truncated."""
+MAX_ENTRY_ID = 2**63 - 1
+"""Largest id the ledger can assign (SQLite's 64-bit INTEGER); no entry has a larger one."""
+
 
 @dataclass(frozen=True, slots=True)
 class EntryDetail:
@@ -35,14 +40,33 @@ class ListHistory:
     repository: LedgerRepository
 
     def execute(self, limit: int = 10, before_id: int | None = None) -> list[Entry]:
-        """Entries newest first; pass the last id of a page as `before_id` for the next one."""
-        if limit < 1 or (before_id is not None and before_id < 1):
-            raise ValueError(f"invalid page: limit={limit}, before_id={before_id}")
+        """Entries newest first; pass the last id of a page as `before_id` for the next one.
+
+        `limit` is an int from 1 to `MAX_HISTORY_PAGE` and `before_id` one from 1 to
+        `MAX_ENTRY_ID`. Anything else raises `TypeError` (not an int, or a bool) or
+        `ValueError` (out of range).
+        """
+        _require_int_between("limit", limit, 1, MAX_HISTORY_PAGE)
+        if before_id is not None:
+            _require_int_between("before_id", before_id, 1, MAX_ENTRY_ID)
         return self.repository.history(limit, before_id)
 
 
 def require_entry(repository: LedgerRepository, entry_id: int) -> Entry:
-    entry = repository.get(entry_id)
+    """The entry with this id; an id no entry can have is simply not found."""
+    _require_int("entry_id", entry_id)
+    entry = repository.get(entry_id) if 1 <= entry_id <= MAX_ENTRY_ID else None
     if entry is None:
         raise EntryNotFoundError(entry_id)
     return entry
+
+
+def _require_int(name: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, not {type(value).__name__}")
+
+
+def _require_int_between(name: str, value: int, low: int, high: int) -> None:
+    _require_int(name, value)
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low} and {high}: {value}")

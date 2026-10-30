@@ -13,7 +13,9 @@ UTF-8 (raw bytes CAST to TEXT, which SQLite stores unchecked) is read with repla
 characters instead of failing to decode.
 
 Transactions are explicit: the connection runs in autocommit mode, so a lone `append`
-commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... COMMIT.
+commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... COMMIT. A
+writer waits up to the busy timeout for another one; past it, the port's `LedgerBusyError`
+is raised instead of SQLite's "database is locked".
 
 The schema version lives in `PRAGMA user_version`; a database from a newer version, or one
 created before versioning, is refused instead of being read with the wrong assumptions.
@@ -25,10 +27,11 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic, sleep
 
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource
 from payments_bot.domain.money import MAX_AMOUNT_MINOR
-from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
+from payments_bot.ports.ledger_repository import ImageAlreadyStoredError, LedgerBusyError
 
 IN_MEMORY = ":memory:"
 SCHEMA_VERSION = 2
@@ -39,6 +42,10 @@ ledger was ever put to use, so there is no migration from it: it is refused like
 """
 BUSY_TIMEOUT_SECONDS = 5.0
 """How long a writer waits for a concurrent unit of work to finish before giving up."""
+_OPEN_RETRY_PAUSE_SECONDS = 0.02
+"""Pause between attempts to prepare a database file another connection is preparing too."""
+_BUSY_ERROR_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+_MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 class UnsupportedSchemaError(RuntimeError):
@@ -213,17 +220,16 @@ _INSERT = (
 class SqliteLedgerRepository:
     """`LedgerRepository` backed by SQLite. It exposes no update or delete operation."""
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, busy_timeout: float = BUSY_TIMEOUT_SECONDS) -> None:
+        self._busy_timeout = busy_timeout
         # autocommit=True: the driver never opens or commits transactions behind our back
         # (unlike isolation_level=None, executescript() then also respects an open one).
-        self._connection = sqlite3.connect(database, autocommit=True, timeout=BUSY_TIMEOUT_SECONDS)
+        self._connection = sqlite3.connect(database, autocommit=True, timeout=busy_timeout)
         self._connection.row_factory = sqlite3.Row
         self._connection.text_factory = _decode_text
         try:
             self._connection.execute("PRAGMA foreign_keys = ON")
-            if str(database) != IN_MEMORY:
-                self._connection.execute("PRAGMA journal_mode = WAL")
-            self._ensure_schema()
+            self._prepare(wal=str(database) != IN_MEMORY)
         except BaseException:
             self._connection.close()
             raise
@@ -237,10 +243,12 @@ class SqliteLedgerRepository:
             raise RuntimeError("atomic blocks cannot be nested")
         # IMMEDIATE takes the write lock before the first read, so two units of work never
         # decide from the same state: the second one waits (busy timeout) for the first.
-        self._connection.execute("BEGIN IMMEDIATE")
+        with self._busy_as_ledger_error():
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield
-            self._connection.execute("COMMIT")
+            with self._busy_as_ledger_error():
+                self._connection.execute("COMMIT")
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -250,7 +258,8 @@ class SqliteLedgerRepository:
         if entry.id is not None:
             raise ValueError(f"entry {entry.id} is already persisted")
         try:
-            cursor = self._connection.execute(_INSERT, _to_row(entry))
+            with self._busy_as_ledger_error():
+                cursor = self._connection.execute(_INSERT, _to_row(entry))
         except sqlite3.IntegrityError as error:
             owner = self._image_owner(entry)
             if owner is not None:
@@ -278,23 +287,57 @@ class SqliteLedgerRepository:
         )
 
     def balance(self) -> dict[str, int]:
-        rows = self._connection.execute(
+        rows = self._rows(
             "SELECT currency, SUM(amount_minor) AS total FROM ledger_entries "
             "GROUP BY currency ORDER BY currency"
         )
         return {row["currency"]: row["total"] for row in rows}
 
     def history(self, limit: int, before_id: int | None = None) -> list[Entry]:
-        if limit < 1:
-            raise ValueError(f"history limit must be at least 1: {limit}")
+        _require_positive_integer("limit", limit)
         if before_id is None:
             return self._fetch_all(
                 "SELECT * FROM ledger_entries ORDER BY id DESC LIMIT ?", (limit,)
             )
+        _require_positive_integer("before_id", before_id)
         return self._fetch_all(
             "SELECT * FROM ledger_entries WHERE id < ? ORDER BY id DESC LIMIT ?",
             (before_id, limit),
         )
+
+    def _prepare(self, *, wal: bool) -> None:
+        """Switch to WAL and create or check the schema, waiting out other openers.
+
+        Switching the journal mode does not wait on the busy timeout: while another
+        connection holds a lock, SQLite answers "database is locked" at once (it would risk a
+        deadlock otherwise), so processes opening a new file together used to fail. Retry
+        the whole preparation until the busy timeout has passed, then give up.
+        """
+        deadline = monotonic() + self._busy_timeout
+        while True:
+            try:
+                with self._busy_as_ledger_error():
+                    if wal:
+                        self._connection.execute("PRAGMA journal_mode = WAL")
+                    self._ensure_schema()
+                return
+            except LedgerBusyError:
+                if monotonic() >= deadline:
+                    raise
+                sleep(_OPEN_RETRY_PAUSE_SECONDS)
+
+    @contextmanager
+    def _busy_as_ledger_error(self) -> Iterator[None]:
+        """Raise the port's `LedgerBusyError` for SQLite's busy and locked errors."""
+        try:
+            yield
+        except sqlite3.OperationalError as error:
+            if not _is_busy(error):
+                raise
+            raise LedgerBusyError(
+                f"ledger database is locked by another connection "
+                f"(busy timeout {self._busy_timeout} s): {error}"
+            ) from error
 
     def _ensure_schema(self) -> None:
         """Create the schema in a new database; refuse one this code cannot read safely."""
@@ -327,23 +370,40 @@ class SqliteLedgerRepository:
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _schema_version(self) -> int:
-        return self._connection.execute("PRAGMA user_version").fetchone()[0]
+        return self._rows("PRAGMA user_version")[0][0]
 
     def _image_owner(self, entry: Entry) -> int | None:
         """Id of the stored entry that already carries `entry`'s image hash, if any."""
         if entry.image_sha256 is None:
             return None
-        row = self._connection.execute(
+        rows = self._rows(
             "SELECT id FROM ledger_entries WHERE image_sha256 = ?", (entry.image_sha256,)
-        ).fetchone()
-        return row["id"] if row is not None else None
+        )
+        return rows[0]["id"] if rows else None
 
     def _fetch_one(self, query: str, params: tuple[object, ...]) -> Entry | None:
-        row = self._connection.execute(query, params).fetchone()
-        return _to_entry(row) if row is not None else None
+        rows = self._rows(query, params)
+        return _to_entry(rows[0]) if rows else None
 
     def _fetch_all(self, query: str, params: tuple[object, ...]) -> list[Entry]:
-        return [_to_entry(row) for row in self._connection.execute(query, params)]
+        return [_to_entry(row) for row in self._rows(query, params)]
+
+    def _rows(self, query: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
+        with self._busy_as_ledger_error():
+            return self._connection.execute(query, params).fetchall()
+
+
+def _is_busy(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in _BUSY_ERROR_CODES
+
+
+def _require_positive_integer(name: str, value: object) -> None:
+    """Refuse what SQLite cannot bind as a positive INTEGER, rather than overflow or coerce."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, not {type(value).__name__}")
+    if not 1 <= value <= _MAX_SQLITE_INTEGER:
+        raise ValueError(f"{name} must be between 1 and {_MAX_SQLITE_INTEGER}: {value}")
 
 
 def _to_row(entry: Entry) -> tuple[object, ...]:
