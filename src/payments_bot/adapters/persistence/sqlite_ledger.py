@@ -5,8 +5,16 @@ DELETE abort in triggers, rows cannot be overwritten through INSERT OR REPLACE,
 adjustments must target an existing payment in the same currency, and no adjustment can
 take its payment's effective amount below zero.
 
+Rows can never be deleted, so a row the domain refuses to load would break `history()` for
+good. The CHECK constraints therefore mirror the domain: ISO 4217 currency, lowercase
+SHA-256 hex, non-blank reasons, bounded amounts, positive ids, and timestamps in exactly the
+UTC text format this adapter writes.
+
 Transactions are explicit: the connection runs in autocommit mode, so a lone `append`
 commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... COMMIT.
+
+The schema version lives in `PRAGMA user_version`; a database from a newer version, or one
+created before versioning, is refused instead of being read with the wrong assumptions.
 """
 
 import sqlite3
@@ -17,29 +25,71 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource
+from payments_bot.domain.money import MAX_AMOUNT_MINOR
 from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
 
 IN_MEMORY = ":memory:"
+SCHEMA_VERSION = 1
+"""Stored in `PRAGMA user_version`; bump it, and migrate from the previous one, on change."""
 BUSY_TIMEOUT_SECONDS = 5.0
 """How long a writer waits for a concurrent unit of work to finish before giving up."""
 
-_SCHEMA = """
+
+class UnsupportedSchemaError(RuntimeError):
+    """The database file was written by a schema version this code cannot read safely."""
+
+
+_UTC_TEXT_GLOB = (
+    "[1-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]"
+    "T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00"
+)
+"""Shape of `_to_text` output, e.g. 2026-10-29T15:00:00.000000+00:00."""
+
+_PYTHON_WHITESPACE = (
+    "\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004"
+    "\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+"""Every character `str.strip()` removes, so the database and the domain agree on blank."""
+
+
+def _utc_text(column: str) -> str:
+    """SQL that holds when `column` is a real calendar instant in exactly the stored format."""
+    seconds = f"substr({column}, 1, 19)"
+    # strftime normalizes impossible dates (Feb 31 -> Mar 3) or returns NULL, so a value
+    # that does not survive the round trip is not a real instant.
+    return (
+        f"{column} GLOB '{_UTC_TEXT_GLOB}' "
+        f"AND strftime('%Y-%m-%dT%H:%M:%S', {seconds}) IS {seconds}"
+    )
+
+
+_BLANK_CHARACTERS = f"char({', '.join(str(ord(char)) for char in _PYTHON_WHITESPACE)})"
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS ledger_entries (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT CONSTRAINT id_positive CHECK (id > 0),
     kind           TEXT    NOT NULL CHECK (kind IN ('payment', 'adjustment')),
-    amount_minor   INTEGER NOT NULL,
-    currency       TEXT    NOT NULL CHECK (length(currency) = 3),
+    amount_minor   INTEGER NOT NULL CONSTRAINT amount_in_range
+                   CHECK (amount_minor BETWEEN -{MAX_AMOUNT_MINOR} AND {MAX_AMOUNT_MINOR}),
+    currency       TEXT    NOT NULL CONSTRAINT currency_iso_4217
+                   CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
     source         TEXT    NOT NULL CHECK (source IN ('ocr', 'manual', 'import')),
     created_by     INTEGER NOT NULL,
-    created_at     TEXT    NOT NULL,
+    created_at     TEXT    NOT NULL CONSTRAINT created_at_utc_text
+                   CHECK ({_utc_text("created_at")}),
     corrects_id    INTEGER REFERENCES ledger_entries (id),
-    reason         TEXT,
+    reason         TEXT    CONSTRAINT reason_not_blank
+                   CHECK (reason IS NULL OR trim(reason, {_BLANK_CHARACTERS}) <> ''),
     reference      TEXT,
-    paid_at        TEXT,
-    image_sha256   TEXT    UNIQUE,
+    paid_at        TEXT    CONSTRAINT paid_at_utc_text
+                   CHECK (paid_at IS NULL OR ({_utc_text("paid_at")})),
+    image_sha256   TEXT    UNIQUE CONSTRAINT image_sha256_hex CHECK (
+                       image_sha256 IS NULL
+                       OR (length(image_sha256) = 64 AND image_sha256 NOT GLOB '*[^0-9a-f]*')
+                   ),
     image_key      TEXT,
     extracted_json TEXT,
-    CHECK (
+    CONSTRAINT entry_kind_shape CHECK (
         (kind = 'payment' AND corrects_id IS NULL AND amount_minor > 0)
         OR (
             kind = 'adjustment'
@@ -134,10 +184,14 @@ class SqliteLedgerRepository:
         # (unlike isolation_level=None, executescript() then also respects an open one).
         self._connection = sqlite3.connect(database, autocommit=True, timeout=BUSY_TIMEOUT_SECONDS)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        if str(database) != IN_MEMORY:
-            self._connection.execute("PRAGMA journal_mode = WAL")
-        self._connection.executescript(_SCHEMA)
+        try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            if str(database) != IN_MEMORY:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            self._ensure_schema()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         self._connection.close()
@@ -195,10 +249,44 @@ class SqliteLedgerRepository:
         )
         return {row["currency"]: row["total"] for row in rows}
 
-    def history(self, limit: int, offset: int = 0) -> list[Entry]:
+    def history(self, limit: int, before_id: int | None = None) -> list[Entry]:
+        if limit < 1:
+            raise ValueError(f"history limit must be at least 1: {limit}")
+        if before_id is None:
+            return self._fetch_all(
+                "SELECT * FROM ledger_entries ORDER BY id DESC LIMIT ?", (limit,)
+            )
         return self._fetch_all(
-            "SELECT * FROM ledger_entries ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+            "SELECT * FROM ledger_entries WHERE id < ? ORDER BY id DESC LIMIT ?",
+            (before_id, limit),
         )
+
+    def _ensure_schema(self) -> None:
+        """Create the schema in a new database; refuse one this code cannot read safely."""
+        if self._schema_version() == SCHEMA_VERSION:
+            return
+        with self.atomic():
+            version = self._schema_version()  # again, now that no one else can write
+            if version == SCHEMA_VERSION:
+                return
+            if version > SCHEMA_VERSION:
+                raise UnsupportedSchemaError(
+                    f"ledger database has schema version {version}; "
+                    f"this code supports up to {SCHEMA_VERSION}"
+                )
+            # Version 0 is a brand-new file. A future version N migrates from N - 1 here.
+            if self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'ledger_entries'"
+            ).fetchone():
+                raise UnsupportedSchemaError(
+                    "ledger database has no schema version: it predates versioning "
+                    "and cannot be migrated"
+                )
+            self._connection.executescript(_SCHEMA)
+            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _schema_version(self) -> int:
+        return self._connection.execute("PRAGMA user_version").fetchone()[0]
 
     def _image_owner(self, entry: Entry) -> int | None:
         """Id of the stored entry that already carries `entry`'s image hash, if any."""
@@ -255,5 +343,5 @@ def _to_entry(row: sqlite3.Row) -> Entry:
 
 
 def _to_text(moment: datetime) -> str:
-    """ISO-8601 in UTC, so stored timestamps sort and compare as text."""
-    return moment.astimezone(UTC).isoformat()
+    """Fixed-width ISO-8601 in UTC, so stored timestamps sort and compare as text."""
+    return moment.astimezone(UTC).isoformat(timespec="microseconds")

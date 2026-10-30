@@ -34,11 +34,11 @@ class GetEntryDetail:
 class ListHistory:
     repository: LedgerRepository
 
-    def execute(self, limit: int = 10, offset: int = 0) -> list[Entry]:
-        """Entries newest first."""
-        if limit < 1 or offset < 0:
-            raise ValueError(f"invalid page: limit={limit}, offset={offset}")
-        return self.repository.history(limit, offset)
+    def execute(self, limit: int = 10, before_id: int | None = None) -> list[Entry]:
+        """Entries newest first; pass the last id of a page as `before_id` for the next one."""
+        if limit < 1 or (before_id is not None and before_id < 1):
+            raise ValueError(f"invalid page: limit={limit}, before_id={before_id}")
+        return self.repository.history(limit, before_id)
 
 
 def require_entry(repository: LedgerRepository, entry_id: int) -> Entry:

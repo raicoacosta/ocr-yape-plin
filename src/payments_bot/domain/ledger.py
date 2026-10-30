@@ -19,7 +19,7 @@ from payments_bot.domain.errors import (
     NoChangeError,
     NotAPaymentError,
 )
-from payments_bot.domain.money import DEFAULT_CURRENCY, validate_currency
+from payments_bot.domain.money import DEFAULT_CURRENCY, MAX_AMOUNT_MINOR, validate_currency
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -99,6 +99,10 @@ def build_correction(
     clean_reason = _require_reason(reason)
     if new_amount_minor < 0:
         raise InvalidAmountError(f"a corrected amount cannot be negative: {new_amount_minor}")
+    if new_amount_minor > MAX_AMOUNT_MINOR:
+        raise InvalidAmountError(
+            f"a corrected amount cannot exceed {MAX_AMOUNT_MINOR}: {new_amount_minor}"
+        )
     delta = new_amount_minor - effective_amount(payment, adjustments)
     if delta == 0:
         raise NoChangeError(f"payment {payment.id} already amounts to {new_amount_minor}")
@@ -148,6 +152,10 @@ def _validate_common(entry: Entry) -> None:
         raise InvalidEntryError("kind and source must be EntryKind and EntrySource members")
     if isinstance(entry.amount_minor, bool) or not isinstance(entry.amount_minor, int):
         raise InvalidEntryError(f"amount must be integer minor units: {entry.amount_minor!r}")
+    if abs(entry.amount_minor) > MAX_AMOUNT_MINOR:
+        raise InvalidAmountError(
+            f"amount exceeds {MAX_AMOUNT_MINOR} minor units: {entry.amount_minor}"
+        )
     validate_currency(entry.currency)
     if entry.created_at.utcoffset() != timedelta(0):
         raise InvalidEntryError("created_at must be a timezone-aware UTC datetime")
@@ -162,6 +170,8 @@ def _validate_payment(entry: Entry) -> None:
         raise InvalidEntryError(f"a payment amount must be positive: {entry.amount_minor}")
     if entry.corrects_id is not None:
         raise InvalidEntryError("a payment cannot correct another entry")
+    if entry.reason is not None and not entry.reason.strip():
+        raise InvalidEntryError("a payment reason, when given, cannot be blank")
 
 
 def _validate_adjustment(entry: Entry) -> None:

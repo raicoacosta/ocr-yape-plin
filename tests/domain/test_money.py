@@ -1,7 +1,12 @@
 import pytest
 
 from payments_bot.domain.errors import InvalidAmountError, InvalidCurrencyError
-from payments_bot.domain.money import DEFAULT_CURRENCY, parse_amount, validate_currency
+from payments_bot.domain.money import (
+    DEFAULT_CURRENCY,
+    MAX_AMOUNT_MINOR,
+    parse_amount,
+    validate_currency,
+)
 
 
 @pytest.mark.parametrize(
@@ -33,6 +38,10 @@ def test_parse_amount_rejects_non_canonical_text(text: str) -> None:
 
 def test_default_currency_is_peruvian_sol() -> None:
     assert DEFAULT_CURRENCY == "PEN"
+
+
+def test_amounts_are_capped_at_one_billion_major_units() -> None:
+    assert MAX_AMOUNT_MINOR == 1_000_000_000_00
 
 
 @pytest.mark.parametrize("code", ["PEN", "USD"])

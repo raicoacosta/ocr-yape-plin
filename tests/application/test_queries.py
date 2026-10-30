@@ -43,19 +43,23 @@ def test_get_entry_detail_of_missing_entry_raises_not_found(
         GetEntryDetail(repository).execute(999)
 
 
-def test_list_history_is_newest_first_and_pages(
+def test_list_history_is_newest_first_and_pages_before_the_last_seen_id(
     repository: SqliteLedgerRepository, register: Register
 ) -> None:
     ids = [register(amount_minor=amount).entry.id for amount in (100, 200, 300)]
     history = ListHistory(repository)
 
-    assert [entry.id for entry in history.execute(limit=2)] == [ids[2], ids[1]]
-    assert [entry.id for entry in history.execute(limit=2, offset=2)] == [ids[0]]
+    first_page = history.execute(limit=2)
+    register(amount_minor=50)
+    second_page = history.execute(limit=2, before_id=first_page[-1].id)
+
+    assert [entry.id for entry in first_page] == [ids[2], ids[1]]
+    assert [entry.id for entry in second_page] == [ids[0]]
 
 
-@pytest.mark.parametrize(("limit", "offset"), [(0, 0), (-1, 0), (10, -1)])
+@pytest.mark.parametrize(("limit", "before_id"), [(0, None), (-1, None), (10, 0), (10, -1)])
 def test_list_history_rejects_invalid_paging(
-    repository: SqliteLedgerRepository, limit: int, offset: int
+    repository: SqliteLedgerRepository, limit: int, before_id: int | None
 ) -> None:
     with pytest.raises(ValueError):
-        ListHistory(repository).execute(limit=limit, offset=offset)
+        ListHistory(repository).execute(limit=limit, before_id=before_id)

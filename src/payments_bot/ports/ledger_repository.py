@@ -51,6 +51,10 @@ class LedgerRepository(Protocol):
         """Sum of every entry in minor units, per currency."""
         ...
 
-    def history(self, limit: int, offset: int = 0) -> list[Entry]:
-        """Entries newest first."""
+    def history(self, limit: int, before_id: int | None = None) -> list[Entry]:
+        """At most `limit` (>= 1) entries newest first, only those older than `before_id`.
+
+        Keyset paging: pass the last id of a page as `before_id` to get the next one, which
+        stays stable when new entries arrive in between.
+        """
         ...

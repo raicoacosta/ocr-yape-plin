@@ -23,6 +23,7 @@ from payments_bot.domain.ledger import (
     effective_amount,
     ensure_adjusts,
 )
+from payments_bot.domain.money import MAX_AMOUNT_MINOR
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
 LIMA = timezone(-timedelta(hours=5))
@@ -103,6 +104,24 @@ class TestEntryInvariants:
     def test_amount_must_be_an_integer_number_of_minor_units(self, amount_minor: Any) -> None:
         with pytest.raises(InvalidEntryError):
             make_payment(amount_minor)
+
+    def test_payment_may_reach_the_maximum_amount(self) -> None:
+        assert make_payment(MAX_AMOUNT_MINOR).amount_minor == MAX_AMOUNT_MINOR
+
+    @pytest.mark.parametrize("amount_minor", [MAX_AMOUNT_MINOR + 1, 2**63])
+    def test_payment_above_the_maximum_is_refused(self, amount_minor: int) -> None:
+        with pytest.raises(InvalidAmountError):
+            make_payment(amount_minor)
+
+    def test_adjustment_is_bounded_by_the_maximum_too(self) -> None:
+        assert make_adjustment(-MAX_AMOUNT_MINOR).amount_minor == -MAX_AMOUNT_MINOR
+        with pytest.raises(InvalidAmountError):
+            make_adjustment(-MAX_AMOUNT_MINOR - 1)
+
+    @pytest.mark.parametrize("reason", ["", "   ", "\t\n"])
+    def test_payment_reason_when_given_cannot_be_blank(self, reason: str) -> None:
+        with pytest.raises(InvalidEntryError):
+            make_payment(reason=reason)
 
     def test_currency_must_be_iso_4217(self) -> None:
         with pytest.raises(InvalidCurrencyError):
@@ -221,6 +240,15 @@ class TestBuildCorrection:
     def test_rejects_negative_new_amount(self) -> None:
         with pytest.raises(InvalidAmountError):
             correct(make_payment(25000), [], -1, "negative")
+
+    def test_new_amount_may_reach_the_maximum(self) -> None:
+        adjustment = correct(make_payment(25000), [], MAX_AMOUNT_MINOR, "big transfer")
+
+        assert adjustment.amount_minor == MAX_AMOUNT_MINOR - 25000
+
+    def test_rejects_new_amount_above_the_maximum(self) -> None:
+        with pytest.raises(InvalidAmountError):
+            correct(make_payment(25000), [], MAX_AMOUNT_MINOR + 1, "too big")
 
     @pytest.mark.parametrize("reason", ["", "   "])
     def test_rejects_blank_reason(self, reason: str) -> None:

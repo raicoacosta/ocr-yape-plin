@@ -7,6 +7,12 @@ from payments_bot.domain.errors import InvalidAmountError, InvalidCurrencyError
 
 DEFAULT_CURRENCY = "PEN"
 MINOR_UNITS_PER_MAJOR = 100
+MAX_AMOUNT_MINOR = 10**11
+"""Largest amount any single entry may carry: 1,000,000,000.00 in major units.
+
+Far above any real receipt, and low enough that summing every entry can never overflow
+the 64-bit integers the storage uses.
+"""
 
 _CANONICAL_AMOUNT = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
 _CURRENCY_CODE = re.compile(r"[A-Z]{3}")

@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -6,8 +7,13 @@ from typing import Any
 
 import pytest
 
-from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerRepository
+from payments_bot.adapters.persistence.sqlite_ledger import (
+    SCHEMA_VERSION,
+    SqliteLedgerRepository,
+    UnsupportedSchemaError,
+)
 from payments_bot.domain.ledger import Entry, EntryKind, EntrySource, balance
+from payments_bot.domain.money import MAX_AMOUNT_MINOR
 from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
@@ -15,6 +21,9 @@ LIMA = timezone(-timedelta(hours=5))
 USER_ID = 1001
 HASH_A = "a" * 64
 HASH_B = "b" * 64
+TS = "2026-10-29T15:00:00.000000+00:00"
+"""`NOW` exactly as the adapter stores it: UTC, microseconds, `+00:00`."""
+PYTHON_WHITESPACE = [chr(code) for code in range(sys.maxunicode + 1) if chr(code).isspace()]
 
 
 def payment(amount_minor: int = 25000, **overrides: Any) -> Entry:
@@ -41,6 +50,25 @@ def adjustment(amount_minor: int, corrects_id: int, **overrides: Any) -> Entry:
         "reason": "wrong amount read",
     }
     return Entry(**(fields | overrides))
+
+
+def raw_payment(**overrides: Any) -> dict[str, Any]:
+    """Columns of a valid payment row, as a raw INSERT would write them."""
+    row = {
+        "kind": "payment",
+        "amount_minor": 100,
+        "currency": "PEN",
+        "source": "ocr",
+        "created_by": USER_ID,
+        "created_at": TS,
+    }
+    return row | overrides
+
+
+def raw_adjustment(corrects_id: int, **overrides: Any) -> dict[str, Any]:
+    """Columns of a valid adjustment row, as a raw INSERT would write them."""
+    row = raw_payment(kind="adjustment", source="manual", corrects_id=corrects_id, reason="fix")
+    return row | {"amount_minor": -100} | overrides
 
 
 def insert_raw(connection: sqlite3.Connection, **columns: Any) -> None:
@@ -89,6 +117,26 @@ class TestPersistence:
 
         assert isinstance(saved.id, int)
         assert repository.get(saved.id) == saved
+
+    def test_timestamps_are_stored_in_one_fixed_utc_format(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        repository.append(payment(paid_at=datetime(2026, 10, 28, 15, 30, tzinfo=LIMA)))
+
+        stored = raw.execute("SELECT created_at, paid_at FROM ledger_entries").fetchone()
+
+        assert stored == (TS, "2026-10-28T20:30:00.000000+00:00")
+
+    def test_raw_rows_in_the_stored_format_are_accepted_and_readable(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        insert_raw(raw, **raw_payment(paid_at=TS, image_sha256=HASH_A, reason=" note "))
+        insert_raw(raw, **raw_adjustment(1, reason="  misread  ", amount_minor=-100))
+
+        history = repository.history(limit=10)
+
+        assert [entry.kind for entry in history] == [EntryKind.ADJUSTMENT, EntryKind.PAYMENT]
+        assert repository.balance() == {"PEN": 0}
 
     def test_get_returns_none_for_unknown_id(self, repository: SqliteLedgerRepository) -> None:
         assert repository.get(999) is None
@@ -167,7 +215,7 @@ class TestAppendOnlyEnforcement:
                 "INSERT OR REPLACE INTO ledger_entries"
                 " (id, kind, amount_minor, currency, source, created_by, created_at)"
                 " VALUES (1, 'payment', 1, 'PEN', 'ocr', 1, ?)",
-                (NOW.isoformat(),),
+                (TS,),
             )
 
         assert repository.balance() == {"PEN": 25000}
@@ -182,7 +230,7 @@ class TestAppendOnlyEnforcement:
                 "INSERT OR REPLACE INTO ledger_entries"
                 " (kind, amount_minor, currency, source, created_by, created_at, image_sha256)"
                 " VALUES ('payment', 1, 'PEN', 'ocr', 1, ?, ?)",
-                (NOW.isoformat(), HASH_A),
+                (TS, HASH_A),
             )
 
         assert repository.balance() == {"PEN": 25000}
@@ -214,7 +262,7 @@ class TestAppendOnlyEnforcement:
                 currency="PEN",
                 source="manual",
                 created_by=USER_ID,
-                created_at=NOW.isoformat(),
+                created_at=TS,
                 corrects_id=original.id,
                 reason="overshoot",
             )
@@ -242,7 +290,7 @@ class TestAppendOnlyEnforcement:
                 currency="PEN",
                 source="manual",
                 created_by=USER_ID,
-                created_at=NOW.isoformat(),
+                created_at=TS,
                 corrects_id=999,
                 reason="no such payment",
             )
@@ -308,11 +356,160 @@ class TestAppendOnlyEnforcement:
             "currency": "PEN",
             "source": "ocr",
             "created_by": USER_ID,
-            "created_at": NOW.isoformat(),
+            "created_at": TS,
         }
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_raw(raw, **(row | overrides))
+
+
+class TestRowsTheDomainCouldNotReadAreRefused:
+    """Rows cannot be deleted, so any row the domain would refuse to load breaks history."""
+
+    @pytest.mark.parametrize(
+        ("overrides", "constraint"),
+        [
+            pytest.param({"id": 0}, "id_positive", id="id-zero"),
+            pytest.param({"id": -1}, "id_positive", id="id-negative"),
+            pytest.param({"amount_minor": MAX_AMOUNT_MINOR + 1}, "amount_in_range", id="huge"),
+            pytest.param({"currency": "pen"}, "currency_iso_4217", id="currency-lowercase"),
+            pytest.param({"currency": "123"}, "currency_iso_4217", id="currency-digits"),
+            pytest.param({"image_sha256": HASH_A.upper()}, "image_sha256_hex", id="hash-upper"),
+            pytest.param({"image_sha256": "not-a-hash"}, "image_sha256_hex", id="hash-garbage"),
+            pytest.param({"image_sha256": "a" * 63}, "image_sha256_hex", id="hash-short"),
+            pytest.param({"image_sha256": "a" * 65}, "image_sha256_hex", id="hash-long"),
+            pytest.param({"created_at": "yesterday"}, "created_at_utc_text", id="ts-garbage"),
+            pytest.param(
+                {"created_at": "2026-10-29T15:00:00+00:00"},
+                "created_at_utc_text",
+                id="ts-without-microseconds",
+            ),
+            pytest.param(
+                {"created_at": "2026-10-29T10:00:00.000000-05:00"},
+                "created_at_utc_text",
+                id="ts-not-utc",
+            ),
+            pytest.param(
+                {"created_at": "2026-10-29 15:00:00.000000+00:00"},
+                "created_at_utc_text",
+                id="ts-space-separator",
+            ),
+            pytest.param(
+                {"created_at": "2026-02-31T15:00:00.000000+00:00"},
+                "created_at_utc_text",
+                id="ts-impossible-day",
+            ),
+            pytest.param(
+                {"created_at": "2026-13-01T15:00:00.000000+00:00"},
+                "created_at_utc_text",
+                id="ts-impossible-month",
+            ),
+            pytest.param(
+                {"created_at": "2026-10-29T24:00:00.000000+00:00"},
+                "created_at_utc_text",
+                id="ts-hour-24",
+            ),
+            pytest.param({"paid_at": "2026-10-28"}, "paid_at_utc_text", id="paid-date-only"),
+            pytest.param(
+                {"paid_at": "2026-10-28T15:30:00.000000-05:00"},
+                "paid_at_utc_text",
+                id="paid-not-utc",
+            ),
+            pytest.param({"reason": ""}, "reason_not_blank", id="payment-reason-empty"),
+            pytest.param({"reason": " \t\u3000\n"}, "reason_not_blank", id="payment-reason-blank"),
+        ],
+    )
+    def test_payment_row(
+        self,
+        repository: SqliteLedgerRepository,
+        raw: sqlite3.Connection,
+        overrides: dict[str, Any],
+        constraint: str,
+    ) -> None:
+        with pytest.raises(sqlite3.IntegrityError, match=constraint):
+            insert_raw(raw, **raw_payment(**overrides))
+
+        assert repository.history(limit=10) == []
+
+    @pytest.mark.parametrize(
+        ("overrides", "constraint"),
+        [
+            pytest.param({"reason": ""}, "reason_not_blank", id="reason-empty"),
+            pytest.param({"reason": "   "}, "reason_not_blank", id="reason-blank"),
+            pytest.param({"reason": None}, "entry_kind_shape", id="reason-missing"),
+            pytest.param({"image_key": "receipts/x.jpg"}, "entry_kind_shape", id="image-key-only"),
+            pytest.param({"image_sha256": HASH_B}, "entry_kind_shape", id="image-hash"),
+        ],
+    )
+    def test_adjustment_row(
+        self,
+        repository: SqliteLedgerRepository,
+        raw: sqlite3.Connection,
+        overrides: dict[str, Any],
+        constraint: str,
+    ) -> None:
+        original = repository.append(payment())
+
+        with pytest.raises(sqlite3.IntegrityError, match=constraint):
+            insert_raw(raw, **raw_adjustment(original.id, **overrides))
+
+        assert repository.history(limit=10) == [original]
+
+    @pytest.mark.parametrize(
+        "blank", PYTHON_WHITESPACE, ids=[f"U+{ord(char):04X}" for char in PYTHON_WHITESPACE]
+    )
+    def test_reason_made_of_any_python_whitespace_is_refused(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection, blank: str
+    ) -> None:
+        original = repository.append(payment())
+
+        with pytest.raises(sqlite3.IntegrityError, match="reason_not_blank"):
+            insert_raw(raw, **raw_adjustment(original.id, reason=blank * 2))
+
+    def test_payment_may_reach_the_maximum_amount(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        insert_raw(raw, **raw_payment(amount_minor=MAX_AMOUNT_MINOR))
+        insert_raw(raw, **raw_payment(amount_minor=MAX_AMOUNT_MINOR))
+
+        assert repository.balance() == {"PEN": 2 * MAX_AMOUNT_MINOR}
+
+    def test_a_refused_negative_id_does_not_block_later_appends(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        with pytest.raises(sqlite3.IntegrityError, match="id_positive"):
+            insert_raw(raw, **raw_payment(id=-1))
+
+        saved = repository.append(payment())
+
+        assert saved.id == 1
+
+
+class TestSchemaVersion:
+    def test_new_database_records_the_schema_version(self, raw: sqlite3.Connection) -> None:
+        assert SCHEMA_VERSION == 1
+        assert raw.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+
+    def test_database_from_a_newer_version_is_refused(
+        self, db_path: Path, raw: sqlite3.Connection
+    ) -> None:
+        raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+
+        with pytest.raises(UnsupportedSchemaError, match=f"version {SCHEMA_VERSION + 1}"):
+            SqliteLedgerRepository(db_path)
+
+    def test_unversioned_ledger_is_refused_instead_of_being_stamped(self, tmp_path: Path) -> None:
+        legacy = tmp_path / "legacy.db"
+        connection = sqlite3.connect(legacy)
+        connection.execute("CREATE TABLE ledger_entries (id INTEGER PRIMARY KEY)")
+        connection.close()
+
+        with pytest.raises(UnsupportedSchemaError, match="no schema version"):
+            SqliteLedgerRepository(legacy)
+
+        connection = sqlite3.connect(legacy)
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        connection.close()
 
 
 class TestUnitOfWork:
@@ -380,11 +577,36 @@ class TestQueries:
     def test_balance_of_an_empty_ledger_is_empty(self, repository: SqliteLedgerRepository) -> None:
         assert repository.balance() == {}
 
-    def test_history_is_newest_first_and_pages(self, repository: SqliteLedgerRepository) -> None:
+    def test_history_is_newest_first_and_pages_by_id(
+        self, repository: SqliteLedgerRepository
+    ) -> None:
         ids = [repository.append(payment(amount)).id for amount in (100, 200, 300)]
 
-        assert [entry.id for entry in repository.history(limit=2)] == [ids[2], ids[1]]
-        assert [entry.id for entry in repository.history(limit=2, offset=2)] == [ids[0]]
+        first_page = repository.history(limit=2)
+        second_page = repository.history(limit=2, before_id=first_page[-1].id)
+
+        assert [entry.id for entry in first_page] == [ids[2], ids[1]]
+        assert [entry.id for entry in second_page] == [ids[0]]
+
+    def test_history_pages_do_not_drift_when_entries_arrive_between_them(
+        self, repository: SqliteLedgerRepository
+    ) -> None:
+        ids = [repository.append(payment(amount)).id for amount in (100, 200, 300, 400)]
+        first_page = repository.history(limit=2)
+
+        repository.append(payment(50))
+        second_page = repository.history(limit=2, before_id=first_page[-1].id)
+
+        assert [entry.id for entry in second_page] == [ids[1], ids[0]]
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_history_refuses_a_non_positive_limit(
+        self, repository: SqliteLedgerRepository, limit: int
+    ) -> None:
+        repository.append(payment())
+
+        with pytest.raises(ValueError, match="limit"):
+            repository.history(limit=limit)
 
     def test_adjustments_for_returns_only_that_payments_adjustments(
         self, repository: SqliteLedgerRepository

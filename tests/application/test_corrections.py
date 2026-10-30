@@ -8,8 +8,14 @@ from payments_bot.application.clock import Clock
 from payments_bot.application.corrections import AdjustmentRecorded, CorrectEntry, VoidEntry
 from payments_bot.application.errors import EntryNotFoundError
 from payments_bot.application.payments import PaymentRegistered
-from payments_bot.domain.errors import AlreadyVoidedError, NoChangeError, NotAPaymentError
+from payments_bot.domain.errors import (
+    AlreadyVoidedError,
+    InvalidAmountError,
+    NoChangeError,
+    NotAPaymentError,
+)
 from payments_bot.domain.ledger import EntryKind
+from payments_bot.domain.money import MAX_AMOUNT_MINOR
 
 Register = Callable[..., PaymentRegistered]
 FIXER_ID = 3003
@@ -81,6 +87,16 @@ class TestCorrectEntry:
             correct(repository, clock, 999, 1000)
 
         assert excinfo.value.entry_id == 999
+
+    def test_amount_above_the_maximum_writes_nothing(
+        self, repository: SqliteLedgerRepository, clock: Clock, register: Register
+    ) -> None:
+        payment = register(amount_minor=25000).entry
+
+        with pytest.raises(InvalidAmountError):
+            correct(repository, clock, payment.id, MAX_AMOUNT_MINOR + 1)
+
+        assert repository.history(limit=10) == [payment]
 
     def test_adjustment_cannot_be_corrected(
         self, repository: SqliteLedgerRepository, clock: Clock, register: Register

@@ -6,7 +6,7 @@ class DomainError(Exception):
 
 
 class InvalidAmountError(DomainError):
-    """An amount is not a canonical, non-negative decimal or minor-unit value."""
+    """An amount is not canonical, is negative where it cannot be, or exceeds the maximum."""
 
 
 class InvalidCurrencyError(DomainError):

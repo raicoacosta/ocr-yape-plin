@@ -8,8 +8,9 @@ from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerReposito
 from payments_bot.application.clock import Clock
 from payments_bot.application.errors import DuplicateImageError
 from payments_bot.application.payments import PaymentRegistered, RegisterPayment
-from payments_bot.domain.errors import InvalidEntryError
+from payments_bot.domain.errors import InvalidAmountError, InvalidEntryError
 from payments_bot.domain.ledger import EntryKind, EntrySource
+from payments_bot.domain.money import MAX_AMOUNT_MINOR
 
 Register = Callable[..., PaymentRegistered]
 HASH_A = "a" * 64
@@ -83,6 +84,16 @@ def test_invalid_payment_writes_nothing(
 ) -> None:
     with pytest.raises(InvalidEntryError):
         register(amount_minor=0)
+
+    assert repository.history(limit=10) == []
+
+
+@pytest.mark.parametrize("amount_minor", [MAX_AMOUNT_MINOR + 1, 2**63])
+def test_amount_above_the_maximum_is_a_domain_error_and_writes_nothing(
+    repository: SqliteLedgerRepository, register: Register, amount_minor: int
+) -> None:
+    with pytest.raises(InvalidAmountError):
+        register(amount_minor=amount_minor)
 
     assert repository.history(limit=10) == []
 
