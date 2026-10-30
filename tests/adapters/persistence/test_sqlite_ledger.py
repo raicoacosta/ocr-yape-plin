@@ -138,6 +138,23 @@ class TestPersistence:
         assert [entry.kind for entry in history] == [EntryKind.ADJUSTMENT, EntryKind.PAYMENT]
         assert repository.balance() == {"PEN": 0}
 
+    def test_text_that_is_not_utf8_is_read_with_replacement_characters(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        # CAST(... AS TEXT) stores raw bytes as TEXT without validating them; such a row
+        # must not make every later read fail to decode.
+        with raw:
+            raw.execute(
+                "INSERT INTO ledger_entries"
+                " (kind, amount_minor, currency, source, created_by, created_at, reason)"
+                " VALUES ('payment', 100, 'PEN', 'ocr', 1, ?, CAST(x'ff41' AS TEXT))",
+                (TS,),
+            )
+
+        (entry,) = repository.history(limit=10)
+
+        assert entry.reason == "�A"
+
     def test_get_returns_none_for_unknown_id(self, repository: SqliteLedgerRepository) -> None:
         assert repository.get(999) is None
 
@@ -270,6 +287,57 @@ class TestAppendOnlyEnforcement:
         repository.append(adjustment(-5000, corrects_id=original.id))
         assert repository.balance() == {"PEN": 0}
 
+    def test_first_adjustment_cannot_overshoot_below_zero(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        original = repository.append(payment(25000))
+
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount negative"):
+            repository.append(adjustment(-25001, corrects_id=original.id))
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount negative"):
+            insert_raw(raw, **raw_adjustment(original.id, amount_minor=-30000))
+
+        assert repository.adjustments_for(original.id) == []
+
+    def test_adjustment_cannot_take_the_payment_above_the_maximum(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        original = repository.append(payment(25000))
+        repository.append(adjustment(MAX_AMOUNT_MINOR - 25000, corrects_id=original.id))
+
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount exceed the maximum"):
+            repository.append(adjustment(1, corrects_id=original.id))
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount exceed the maximum"):
+            insert_raw(raw, **raw_adjustment(original.id, amount_minor=MAX_AMOUNT_MINOR))
+
+        # A payment held at the maximum can still be voided by one in-range adjustment.
+        repository.append(adjustment(-MAX_AMOUNT_MINOR, corrects_id=original.id))
+        assert repository.balance() == {"PEN": 0}
+
+    def test_first_adjustment_cannot_overshoot_above_the_maximum(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        biggest = repository.append(payment(MAX_AMOUNT_MINOR))
+        smallest = repository.append(payment(1))
+
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount exceed the maximum"):
+            insert_raw(raw, **raw_adjustment(biggest.id, amount_minor=MAX_AMOUNT_MINOR))
+        with pytest.raises(sqlite3.IntegrityError, match="payment amount exceed the maximum"):
+            repository.append(adjustment(MAX_AMOUNT_MINOR, corrects_id=smallest.id))
+
+        assert repository.balance() == {"PEN": MAX_AMOUNT_MINOR + 1}
+
+    def test_adjustment_amount_is_bounded_below_by_minus_the_maximum(
+        self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
+    ) -> None:
+        biggest = repository.append(payment(MAX_AMOUNT_MINOR))
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_raw(raw, **raw_adjustment(biggest.id, amount_minor=-MAX_AMOUNT_MINOR - 1))
+        insert_raw(raw, **raw_adjustment(biggest.id, amount_minor=-MAX_AMOUNT_MINOR))
+
+        assert repository.balance() == {"PEN": 0}
+
     def test_adjustment_cannot_target_another_adjustment(
         self, repository: SqliteLedgerRepository
     ) -> None:
@@ -372,12 +440,31 @@ class TestRowsTheDomainCouldNotReadAreRefused:
             pytest.param({"id": 0}, "id_positive", id="id-zero"),
             pytest.param({"id": -1}, "id_positive", id="id-negative"),
             pytest.param({"amount_minor": MAX_AMOUNT_MINOR + 1}, "amount_in_range", id="huge"),
+            pytest.param(
+                {"amount_minor": -MAX_AMOUNT_MINOR - 1}, "amount_in_range", id="huge-negative"
+            ),
             pytest.param({"currency": "pen"}, "currency_iso_4217", id="currency-lowercase"),
             pytest.param({"currency": "123"}, "currency_iso_4217", id="currency-digits"),
             pytest.param({"image_sha256": HASH_A.upper()}, "image_sha256_hex", id="hash-upper"),
             pytest.param({"image_sha256": "not-a-hash"}, "image_sha256_hex", id="hash-garbage"),
             pytest.param({"image_sha256": "a" * 63}, "image_sha256_hex", id="hash-short"),
             pytest.param({"image_sha256": "a" * 65}, "image_sha256_hex", id="hash-long"),
+            # GLOB and length() stop at the first NUL, so a valid prefix must not pass for
+            # the whole value.
+            pytest.param({"kind": "payment\x00x"}, "kind IN", id="kind-nul"),
+            pytest.param({"source": "ocr\x00x"}, "source IN", id="source-nul"),
+            pytest.param({"currency": "PEN\x00x"}, "currency_iso_4217", id="currency-nul"),
+            pytest.param(
+                {"image_sha256": HASH_A + "\x00ZZ"}, "image_sha256_hex", id="hash-nul-suffix"
+            ),
+            pytest.param(
+                {"created_at": TS + "\x00junk"}, "created_at_utc_text", id="ts-nul-suffix"
+            ),
+            pytest.param({"paid_at": TS + "\x00junk"}, "paid_at_utc_text", id="paid-nul-suffix"),
+            pytest.param({"reason": "note\x00"}, "reason_no_nul", id="reason-nul"),
+            pytest.param({"reference": "00012345\x00"}, "reference_no_nul", id="reference-nul"),
+            pytest.param({"image_key": "a.jpg\x00"}, "image_key_no_nul", id="image-key-nul"),
+            pytest.param({"extracted_json": "{}\x00"}, "extracted_json_no_nul", id="json-nul"),
             pytest.param({"created_at": "yesterday"}, "created_at_utc_text", id="ts-garbage"),
             pytest.param(
                 {"created_at": "2026-10-29T15:00:00+00:00"},
@@ -436,6 +523,7 @@ class TestRowsTheDomainCouldNotReadAreRefused:
         [
             pytest.param({"reason": ""}, "reason_not_blank", id="reason-empty"),
             pytest.param({"reason": "   "}, "reason_not_blank", id="reason-blank"),
+            pytest.param({"reason": "fix\x00"}, "reason_no_nul", id="reason-nul"),
             pytest.param({"reason": None}, "entry_kind_shape", id="reason-missing"),
             pytest.param({"image_key": "receipts/x.jpg"}, "entry_kind_shape", id="image-key-only"),
             pytest.param({"image_sha256": HASH_B}, "entry_kind_shape", id="image-hash"),
@@ -487,8 +575,27 @@ class TestRowsTheDomainCouldNotReadAreRefused:
 
 class TestSchemaVersion:
     def test_new_database_records_the_schema_version(self, raw: sqlite3.Connection) -> None:
-        assert SCHEMA_VERSION == 1
+        assert SCHEMA_VERSION == 2
         assert raw.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+
+    def test_database_from_an_older_version_is_refused_and_left_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        older = tmp_path / "older.db"
+        connection = sqlite3.connect(older)
+        connection.execute("CREATE TABLE ledger_entries (id INTEGER PRIMARY KEY)")
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+        connection.close()
+
+        with pytest.raises(UnsupportedSchemaError, match=f"version {SCHEMA_VERSION - 1};"):
+            SqliteLedgerRepository(older)
+
+        connection = sqlite3.connect(older)
+        assert connection.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION - 1,)
+        assert connection.execute("SELECT name FROM sqlite_master").fetchall() == [
+            ("ledger_entries",)
+        ]
+        connection.close()
 
     def test_database_from_a_newer_version_is_refused(
         self, db_path: Path, raw: sqlite3.Connection

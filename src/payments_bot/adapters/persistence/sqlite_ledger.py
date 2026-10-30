@@ -3,12 +3,14 @@
 Defense in depth: besides the domain rules, the schema itself refuses edits. UPDATE and
 DELETE abort in triggers, rows cannot be overwritten through INSERT OR REPLACE,
 adjustments must target an existing payment in the same currency, and no adjustment can
-take its payment's effective amount below zero.
+take its payment's effective amount below zero or above `MAX_AMOUNT_MINOR`.
 
 Rows can never be deleted, so a row the domain refuses to load would break `history()` for
 good. The CHECK constraints therefore mirror the domain: ISO 4217 currency, lowercase
-SHA-256 hex, non-blank reasons, bounded amounts, positive ids, and timestamps in exactly the
-UTC text format this adapter writes.
+SHA-256 hex, non-blank reasons, bounded amounts, positive ids, no NUL character in any text,
+and timestamps in exactly the UTC text format this adapter writes. Text that is not valid
+UTF-8 (raw bytes CAST to TEXT, which SQLite stores unchecked) is read with replacement
+characters instead of failing to decode.
 
 Transactions are explicit: the connection runs in autocommit mode, so a lone `append`
 commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... COMMIT.
@@ -29,8 +31,12 @@ from payments_bot.domain.money import MAX_AMOUNT_MINOR
 from payments_bot.ports.ledger_repository import ImageAlreadyStoredError
 
 IN_MEMORY = ":memory:"
-SCHEMA_VERSION = 1
-"""Stored in `PRAGMA user_version`; bump it, and migrate from the previous one, on change."""
+SCHEMA_VERSION = 2
+"""Stored in `PRAGMA user_version`; bump it, and migrate from the previous one, on change.
+
+Version 2 made the text checks NUL-safe and bounded the effective amount above. No version 1
+ledger was ever put to use, so there is no migration from it: it is refused like any other.
+"""
 BUSY_TIMEOUT_SECONDS = 5.0
 """How long a writer waits for a concurrent unit of work to finish before giving up."""
 
@@ -52,15 +58,29 @@ _PYTHON_WHITESPACE = (
 """Every character `str.strip()` removes, so the database and the domain agree on blank."""
 
 
+def _no_nul(column: str) -> str:
+    """SQL that holds when `column` has no NUL character.
+
+    GLOB and length() stop at the first NUL, so without this a valid prefix followed by a NUL
+    and anything at all would pass the other checks. instr() and comparisons do not stop.
+    """
+    return f"instr({column}, char(0)) = 0"
+
+
 def _utc_text(column: str) -> str:
     """SQL that holds when `column` is a real calendar instant in exactly the stored format."""
     seconds = f"substr({column}, 1, 19)"
     # strftime normalizes impossible dates (Feb 31 -> Mar 3) or returns NULL, so a value
     # that does not survive the round trip is not a real instant.
     return (
-        f"{column} GLOB '{_UTC_TEXT_GLOB}' "
+        f"{column} GLOB '{_UTC_TEXT_GLOB}' AND {_no_nul(column)} "
         f"AND strftime('%Y-%m-%dT%H:%M:%S', {seconds}) IS {seconds}"
     )
+
+
+def _optional_text(column: str) -> str:
+    """Named CHECK refusing a NUL character in a free-text column that may be NULL."""
+    return f"CONSTRAINT {column}_no_nul CHECK ({column} IS NULL OR {_no_nul(column)})"
 
 
 _BLANK_CHARACTERS = f"char({', '.join(str(ord(char)) for char in _PYTHON_WHITESPACE)})"
@@ -72,23 +92,28 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     amount_minor   INTEGER NOT NULL CONSTRAINT amount_in_range
                    CHECK (amount_minor BETWEEN -{MAX_AMOUNT_MINOR} AND {MAX_AMOUNT_MINOR}),
     currency       TEXT    NOT NULL CONSTRAINT currency_iso_4217
-                   CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
+                   CHECK (currency GLOB '[A-Z][A-Z][A-Z]' AND {_no_nul("currency")}),
     source         TEXT    NOT NULL CHECK (source IN ('ocr', 'manual', 'import')),
     created_by     INTEGER NOT NULL,
     created_at     TEXT    NOT NULL CONSTRAINT created_at_utc_text
                    CHECK ({_utc_text("created_at")}),
     corrects_id    INTEGER REFERENCES ledger_entries (id),
     reason         TEXT    CONSTRAINT reason_not_blank
-                   CHECK (reason IS NULL OR trim(reason, {_BLANK_CHARACTERS}) <> ''),
-    reference      TEXT,
+                   CHECK (reason IS NULL OR trim(reason, {_BLANK_CHARACTERS}) <> '')
+                   {_optional_text("reason")},
+    reference      TEXT    {_optional_text("reference")},
     paid_at        TEXT    CONSTRAINT paid_at_utc_text
                    CHECK (paid_at IS NULL OR ({_utc_text("paid_at")})),
     image_sha256   TEXT    UNIQUE CONSTRAINT image_sha256_hex CHECK (
                        image_sha256 IS NULL
-                       OR (length(image_sha256) = 64 AND image_sha256 NOT GLOB '*[^0-9a-f]*')
+                       OR (
+                           length(image_sha256) = 64
+                           AND image_sha256 NOT GLOB '*[^0-9a-f]*'
+                           AND {_no_nul("image_sha256")}
+                       )
                    ),
-    image_key      TEXT,
-    extracted_json TEXT,
+    image_key      TEXT    {_optional_text("image_key")},
+    extracted_json TEXT    {_optional_text("extracted_json")},
     CONSTRAINT entry_kind_shape CHECK (
         (kind = 'payment' AND corrects_id IS NULL AND amount_minor > 0)
         OR (
@@ -139,19 +164,28 @@ BEGIN
     SELECT RAISE(ABORT, 'adjustment must target a payment in the same currency');
 END;
 
--- Whatever a caller computed from a stale read, an adjustment can never push its payment's
--- effective amount (payment plus every adjustment) below zero.
-CREATE TRIGGER IF NOT EXISTS ledger_entries_effective_not_negative
+-- Whatever a caller computed from a stale read, an adjustment can never take its payment's
+-- effective amount (payment plus every adjustment) below zero, nor above the maximum: a
+-- payment beyond it could no longer be voided by one adjustment within amount_in_range.
+-- LEFT JOIN: a payment's first adjustment has no earlier adjustment to join with.
+CREATE TRIGGER IF NOT EXISTS ledger_entries_effective_in_range
 BEFORE INSERT ON ledger_entries
 WHEN NEW.kind = 'adjustment'
-    AND NEW.amount_minor + (
-        SELECT payment.amount_minor + coalesce(sum(adjustment.amount_minor), 0)
-        FROM ledger_entries AS payment
-        LEFT JOIN ledger_entries AS adjustment ON adjustment.corrects_id = payment.id
-        WHERE payment.id = NEW.corrects_id AND payment.kind = 'payment'
-    ) < 0
 BEGIN
-    SELECT RAISE(ABORT, 'adjustment would make the payment amount negative');
+    SELECT CASE
+        WHEN effective < 0
+            THEN RAISE(ABORT, 'adjustment would make the payment amount negative')
+        WHEN effective > {MAX_AMOUNT_MINOR}
+            THEN RAISE(ABORT, 'adjustment would make the payment amount exceed the maximum')
+    END
+    FROM (
+        SELECT NEW.amount_minor + (
+            SELECT payment.amount_minor + coalesce(sum(adjustment.amount_minor), 0)
+            FROM ledger_entries AS payment
+            LEFT JOIN ledger_entries AS adjustment ON adjustment.corrects_id = payment.id
+            WHERE payment.id = NEW.corrects_id AND payment.kind = 'payment'
+        ) AS effective
+    );
 END;
 """
 
@@ -184,6 +218,7 @@ class SqliteLedgerRepository:
         # (unlike isolation_level=None, executescript() then also respects an open one).
         self._connection = sqlite3.connect(database, autocommit=True, timeout=BUSY_TIMEOUT_SECONDS)
         self._connection.row_factory = sqlite3.Row
+        self._connection.text_factory = _decode_text
         try:
             self._connection.execute("PRAGMA foreign_keys = ON")
             if str(database) != IN_MEMORY:
@@ -274,7 +309,13 @@ class SqliteLedgerRepository:
                     f"ledger database has schema version {version}; "
                     f"this code supports up to {SCHEMA_VERSION}"
                 )
-            # Version 0 is a brand-new file. A future version N migrates from N - 1 here.
+            # A future version N migrates from N - 1 here; no older version migrates today.
+            if version != 0:
+                raise UnsupportedSchemaError(
+                    f"ledger database has schema version {version}; "
+                    f"this code needs {SCHEMA_VERSION} and cannot migrate from it"
+                )
+            # Version 0 is a brand-new file, unless it already holds a ledger.
             if self._connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'ledger_entries'"
             ).fetchone():
@@ -340,6 +381,11 @@ def _to_entry(row: sqlite3.Row) -> Entry:
         image_key=row["image_key"],
         extracted_json=row["extracted_json"],
     )
+
+
+def _decode_text(data: bytes) -> str:
+    """Decode stored TEXT; bytes that are not UTF-8 become U+FFFD instead of failing the read."""
+    return data.decode("utf-8", errors="replace")
 
 
 def _to_text(moment: datetime) -> str:

@@ -22,6 +22,7 @@ from payments_bot.domain.errors import (
 from payments_bot.domain.money import DEFAULT_CURRENCY, MAX_AMOUNT_MINOR, validate_currency
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_FREE_TEXT_FIELDS = ("reason", "reference", "image_key", "extracted_json")
 
 
 class EntryKind(StrEnum):
@@ -163,6 +164,22 @@ def _validate_common(entry: Entry) -> None:
         raise InvalidEntryError("paid_at must be timezone-aware")
     if entry.image_sha256 is not None and not _SHA256_HEX.fullmatch(entry.image_sha256):
         raise InvalidEntryError("image_sha256 must be 64 lowercase hex characters")
+    for field in _FREE_TEXT_FIELDS:
+        _validate_text(field, getattr(entry, field))
+
+
+def _validate_text(field: str, value: str | None) -> None:
+    """Free text must be storable as is: no NUL character, nothing UTF-8 cannot encode."""
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise InvalidEntryError(f"{field} must be text: {value!r}")
+    if "\x00" in value:
+        raise InvalidEntryError(f"{field} cannot contain a NUL character")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidEntryError(f"{field} contains characters UTF-8 cannot encode") from None
 
 
 def _validate_payment(entry: Entry) -> None:

@@ -123,9 +123,24 @@ class TestEntryInvariants:
         with pytest.raises(InvalidEntryError):
             make_payment(reason=reason)
 
-    def test_currency_must_be_iso_4217(self) -> None:
+    @pytest.mark.parametrize("field", ["reason", "reference", "image_key", "extracted_json"])
+    @pytest.mark.parametrize(
+        "text", [pytest.param("a\x00b", id="nul"), pytest.param("a\ud800", id="lone-surrogate")]
+    )
+    def test_text_fields_refuse_nul_and_characters_utf8_cannot_store(
+        self, field: str, text: str
+    ) -> None:
+        with pytest.raises(InvalidEntryError, match=field):
+            make_payment(**{field: text})
+
+    def test_adjustment_reason_refuses_nul(self) -> None:
+        with pytest.raises(InvalidEntryError, match="reason"):
+            make_adjustment(-500, reason="misread\x00")
+
+    @pytest.mark.parametrize("currency", ["soles", "PEN\x00", "PEN\x00x"])
+    def test_currency_must_be_iso_4217(self, currency: str) -> None:
         with pytest.raises(InvalidCurrencyError):
-            make_payment(currency="soles")
+            make_payment(currency=currency)
 
     @pytest.mark.parametrize(
         "created_at",
