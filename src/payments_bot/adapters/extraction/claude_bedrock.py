@@ -12,13 +12,12 @@ deployment fails loudly instead of marking every receipt as failed.
 
 import base64
 import json
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Protocol
-from urllib.parse import urlsplit, urlunsplit
-from zoneinfo import ZoneInfo
 
 import anthropic
 
@@ -44,12 +43,19 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS = 16000
 """Claude Opus 5.5 always thinks, and thinking counts toward this limit."""
 
-RECEIPT_TIMEZONE = ZoneInfo("America/Lima")
-"""Receipts print Lima wall-clock time without an offset."""
+RECEIPT_TIMEZONE = timezone(timedelta(hours=-5), "PET")
+"""Receipts print Lima wall-clock time without an offset. Peru has kept UTC-5 without daylight
+saving time since 1994, so a fixed offset is exact for every plausible receipt and needs no
+time zone database."""
+
+EARLIEST_RECEIPT_DATE = date(2016, 1, 1)
+"""Receipt dates before this one, or after tomorrow in Lima, are misreads: they are dropped
+(`paid_on` and `paid_at` None) without changing the status."""
 
 MAX_PRINTED_NUMBER_DIGITS = 32
-"""Longest operation number or security code kept. Real ones are far shorter; a longer digit
-string is noise, and it could never equal an amount below `MAX_AMOUNT_MINOR` anyway."""
+"""Longest operation number kept as the `reference`, leading zeros included. Real ones are far
+shorter, so a longer digit string is noise. The cap only decides what is kept: the operation
+number and security code guards compare every digit printed, whatever its length."""
 
 _RETRYABLE_STATUS_ERRORS = (
     anthropic.InternalServerError,
@@ -86,8 +92,11 @@ class ClaudeBedrockExtractor:
         model: str = DEFAULT_MODEL,
         effort: str = DEFAULT_EFFORT,
         max_tokens: int = MAX_TOKENS,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        """`clock` returns the current aware time; it bounds plausible receipt dates."""
         _check_effort(effort)
+        self._clock = clock
         self._client = client
         self._model = model
         self._effort = effort
@@ -177,8 +186,8 @@ class ClaudeBedrockExtractor:
         """Turn a schema-valid answer into a status. Only a high-confidence amount that passes
         every check is `ok`; a doubtful candidate is `needs_confirmation`; a number that cannot
         be the amount is `unreadable`, so no candidate is shown for the user to rubber-stamp."""
-        reference = _digits(answer.operation_number)
-        paid_on, paid_at = _receipt_moment(answer.paid_at)
+        reference = _reference(answer.operation_number)
+        paid_on, paid_at = self._plausible(*_receipt_moment(answer.paid_at))
         confidence = Confidence(answer.confidence)
         result = partial(
             Extraction,
@@ -205,7 +214,7 @@ class ClaudeBedrockExtractor:
             return unreadable(error=f"amount {shown} is zero")
         if amount_minor > MAX_AMOUNT_MINOR:
             return unreadable(error=f"amount {shown} is above the largest amount the ledger takes")
-        if _spells(amount_minor, reference):
+        if _spells(amount_minor, answer.operation_number):
             return unreadable(error=f"amount {shown} repeats the operation number's digits")
         currency = _clean(answer.currency)
         if currency not in CURRENCIES:
@@ -213,7 +222,7 @@ class ClaudeBedrockExtractor:
                 error=f"currency {answer.currency!r} is not one of {', '.join(CURRENCIES)}"
             )
         candidate = partial(result, amount_minor=amount_minor, currency=currency)
-        if _spells(amount_minor, _digits(answer.security_code)):
+        if _spells(amount_minor, answer.security_code):
             return candidate(
                 status=ExtractionStatus.NEEDS_CONFIRMATION,
                 error=f"amount {shown} repeats the security code's digits; confirm it",
@@ -224,6 +233,18 @@ class ClaudeBedrockExtractor:
                 error=f"model confidence is {confidence}; confirm the amount",
             )
         return candidate(status=ExtractionStatus.OK)
+
+    def _plausible(
+        self, paid_on: date | None, paid_at: datetime | None
+    ) -> tuple[date | None, datetime | None]:
+        """The receipt's date and time, or (None, None) when the date cannot be a receipt's:
+        before `EARLIEST_RECEIPT_DATE` or after tomorrow in Lima."""
+        if paid_on is None:
+            return None, None
+        tomorrow = self._clock().astimezone(RECEIPT_TIMEZONE).date() + timedelta(days=1)
+        if not EARLIEST_RECEIPT_DATE <= paid_on <= tomorrow:
+            return None, None
+        return paid_on, paid_at
 
     def _failed(
         self, error: str, *, usage: TokenUsage | None = None, raw_json: str | None = None
@@ -256,10 +277,14 @@ class _ReceiptAnswer:
 
     @classmethod
     def parse(cls, text: str) -> "_ReceiptAnswer":
+        """Every field's type is checked before its value is used, so no answer can raise
+        anything but `_SchemaMismatchError`."""
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise _SchemaMismatchError("answer is not valid JSON") from exc
+            data = json.loads(text, object_pairs_hook=_object_without_repeated_keys)
+        except (ValueError, RecursionError) as exc:
+            # ValueError covers JSONDecodeError and integer literals over Python's digit
+            # limit; RecursionError covers nesting deeper than the parser's recursion limit.
+            raise _SchemaMismatchError("answer is not JSON this parser can read") from exc
         expected = {field.name for field in fields(cls)}
         if not isinstance(data, dict) or set(data) != expected:
             raise _SchemaMismatchError("answer does not have the receipt schema's fields")
@@ -268,9 +293,21 @@ class _ReceiptAnswer:
         optional_text = expected - {"is_payment_receipt", "confidence"}
         if any(data[key] is not None and not isinstance(data[key], str) for key in optional_text):
             raise _SchemaMismatchError("a text field is neither a string nor null")
-        if data["confidence"] not in {level.value for level in Confidence}:
-            raise _SchemaMismatchError(f"unknown confidence {data['confidence']!r}")
+        confidence = data["confidence"]
+        if not isinstance(confidence, str) or confidence not in set(Confidence):
+            raise _SchemaMismatchError(f"confidence is not one of {', '.join(Confidence)}")
         return cls(**data)
+
+
+def _object_without_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object, refusing a key given twice: `json.loads` would silently keep the last
+    value, so `{"amount": "250", ..., "amount": "999"}` would read as 999."""
+    data: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in data:
+            raise _SchemaMismatchError(f"answer repeats the key {_excerpt(key)}")
+        data[key] = value
+    return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,15 +414,23 @@ def build_bedrock_extractor(
 
 
 def _mask_url_secrets(url: str) -> str:
-    """Hide credentials a URL may carry (user, password, query string) before printing it."""
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "(unparsable URL)"
-    netloc = parts.netloc
-    if "@" in netloc:
-        netloc = "***@" + netloc.rpartition("@")[2]
-    return urlunsplit((parts.scheme, netloc, parts.path, "***" if parts.query else "", ""))
+    """Hide credentials a URL may carry (user, password, query string) before printing it.
+
+    Does not rely on a URL parser: without "scheme://" a parser finds no user part, and a "/",
+    "?" or "#" inside a password ends the user part early, so the password would be printed as
+    host or path. Instead anything before the last "@" is masked, the query is masked and the
+    fragment dropped; a URL that is not http(s) is not shown at all.
+    """
+    if not url:
+        return url
+    scheme, separator, rest = url.partition("://")
+    if not separator or scheme.lower() not in {"http", "https"}:
+        return "(not an http or https URL, not shown)"
+    if "@" in rest:
+        rest = "***@" + rest.rpartition("@")[2]
+    rest = rest.partition("#")[0]
+    rest, query_mark, _ = rest.partition("?")
+    return f"{scheme}://{rest}{'?***' if query_mark else ''}"
 
 
 def _check_effort(effort: str) -> None:
@@ -411,31 +456,40 @@ def _excerpt(text: str, limit: int = 40) -> str:
     return repr(text) if len(text) <= limit else f"{text[:limit]!r}... ({len(text)} characters)"
 
 
-def _digits(text: str | None) -> str | None:
-    """The ASCII digits of a printed number: "N° 0001-2345" -> "00012345".
+def _ascii_digits(text: str | None) -> str:
+    """Every digit of a printed number, as ASCII: "N° 0001-2345" -> "00012345".
 
-    None when there are no digits or more than `MAX_PRINTED_NUMBER_DIGITS`. Other digit
-    scripts (superscripts, Arabic-Indic) are dropped, never converted. Never raises.
+    A digit from another script ("１", "١", "۱", "¹") becomes its ASCII digit instead of being
+    dropped, which would corrupt the number ("1２345" -> "1345"). Anything that is not a single
+    digit (spaces, dashes, labels, "½") is dropped. Never raises; "" when there is no digit.
     """
     if text is None:
-        return None
-    digits = "".join(char for char in text if char in "0123456789")
-    if not digits or len(digits) > MAX_PRINTED_NUMBER_DIGITS:
-        return None
-    return digits
+        return ""
+    return "".join(
+        str(value) for char in text if (value := unicodedata.digit(char, None)) is not None
+    )
 
 
-def _spells(amount_minor: int, digits: str | None) -> bool:
-    """Whether the amount's digits are `digits` (leading zeros ignored), wherever the decimal
-    point fell: operation number 00012345 matches S/ 12345, S/ 12345.00, S/ 1234.50 and
-    S/ 123.45. Compares text, so no printed number is ever converted to an integer."""
-    if digits is None or not digits.lstrip("0"):
+def _reference(text: str | None) -> str | None:
+    """The operation number as stored: its ASCII digits, leading zeros kept. None when there
+    are no digits or more than `MAX_PRINTED_NUMBER_DIGITS` (noise)."""
+    digits = _ascii_digits(text)
+    return digits if 0 < len(digits) <= MAX_PRINTED_NUMBER_DIGITS else None
+
+
+def _spells(amount_minor: int, printed: str | None) -> bool:
+    """Whether the amount's digits are the printed number's digits (leading zeros ignored),
+    wherever the decimal point fell: operation number 00012345 matches S/ 12345, S/ 12345.00,
+    S/ 1234.50 and S/ 123.45. Sees every digit, however long the number, so no length cap can
+    hide a match. Compares text, so no printed number is ever converted to an integer."""
+    significant = _ascii_digits(printed).lstrip("0")
+    if not significant:
         return False
     spellings = {str(amount_minor)}
     for shift in (10, 100):
         if amount_minor % shift == 0:
             spellings.add(str(amount_minor // shift))
-    return digits.lstrip("0") in spellings
+    return significant in spellings
 
 
 def _receipt_moment(text: str | None) -> tuple[date | None, datetime | None]:

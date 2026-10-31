@@ -58,9 +58,11 @@ class Extraction:
     """Between 1 and `MAX_AMOUNT_MINOR` for `ok` and `needs_confirmation`; None otherwise."""
     currency: str | None = None
     reference: str | None = None
-    """Operation number printed on the receipt, as ASCII digits."""
+    """Operation number printed on the receipt, as ASCII digits (digits of other scripts
+    converted, leading zeros kept); None when absent or implausibly long."""
     paid_on: date | None = None
-    """Payment date printed on the receipt (a Lima calendar date)."""
+    """Payment date printed on the receipt (a Lima calendar date); None when absent or not a
+    plausible receipt date."""
     paid_at: datetime | None = None
     """Timezone-aware payment time, only when the receipt prints a time of day.
 

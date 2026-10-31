@@ -1,10 +1,10 @@
 import base64
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import anthropic
+import httpx2
 import pytest
 from anthropic.types import Message
 
@@ -39,13 +39,16 @@ from tests.adapters.extraction.fakes import (
     status_error,
 )
 
-LIMA = ZoneInfo("America/Lima")
+LIMA = timezone(timedelta(hours=-5))
 PAID_AT_LIMA = datetime(2026, 1, 15, 9, 30, tzinfo=LIMA)
+NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
+"""10:00 on 2026-10-29 in Lima: receipts dated up to 2026-10-30 are plausible."""
 
 
 def run(
     reply: Message | Exception, image: bytes = JPEG_BYTES, **options: Any
 ) -> tuple[Extraction, FakeMessages]:
+    options.setdefault("clock", lambda: NOW)
     client = fake_client(reply)
     extraction = ClaudeBedrockExtractor(client, **options).extract(image)
     return extraction, client.messages
@@ -212,8 +215,11 @@ def test_system_prompt_shows_how_decimal_commas_become_canonical(
 
 
 def test_system_prompt_keeps_illegible_digits_out_of_low_confidence() -> None:
+    assert (
+        "Confidence never covers illegible digits: if any digit of the amount is cut off, "
+        "blurred, covered or otherwise illegible, the amount is null."
+    ) in SYSTEM_PROMPT
     assert "any digit of the amount is cut off" in SYSTEM_PROMPT
-    assert "never covers illegible digits" in SYSTEM_PROMPT
 
 
 def test_system_prompt_asks_for_lima_wall_clock_time_without_an_offset() -> None:
@@ -276,8 +282,61 @@ def test_naive_receipt_time_is_read_as_lima_local_time() -> None:
 
     assert extraction.paid_at == PAID_AT_LIMA
     assert extraction.paid_at is not None
-    assert extraction.paid_at.tzinfo == LIMA
+    assert extraction.paid_at.utcoffset() == timedelta(hours=-5)
     assert extraction.paid_on == date(2026, 1, 15)
+
+
+def test_lima_time_is_a_fixed_utc_minus_5_offset_that_needs_no_time_zone_database() -> None:
+    """Peru has kept UTC-5 without daylight saving time since 1994."""
+    extraction, _ = run(answer(paid_at="2026-01-15T09:30:00"))
+
+    assert extraction.paid_at is not None
+    assert extraction.paid_at.tzinfo is not None
+    assert extraction.paid_at.tzinfo.utcoffset(None) == timedelta(hours=-5)
+
+
+@pytest.mark.parametrize(
+    "paid_at",
+    [
+        "0001-01-01T00:00:00",
+        "9999-12-31T23:59:59",
+        "2015-12-31T23:59:59",
+        "2015-12-31",
+        "2026-10-31T00:00:00",
+        "2026-10-31",
+    ],
+)
+def test_receipt_date_outside_the_plausible_range_is_dropped_without_changing_the_status(
+    paid_at: str,
+) -> None:
+    extraction, _ = run(answer(paid_at=paid_at))
+
+    assert extraction.status is ExtractionStatus.OK
+    assert extraction.paid_on is None
+    assert extraction.paid_at is None
+
+
+@pytest.mark.parametrize(
+    ("paid_at", "paid_on"),
+    [
+        ("2016-01-01T00:00:00", date(2016, 1, 1)),
+        ("2016-01-01", date(2016, 1, 1)),
+        ("2026-10-30T23:59:59", date(2026, 10, 30)),
+        ("2026-10-30", date(2026, 10, 30)),
+    ],
+)
+def test_receipt_date_from_2016_to_tomorrow_in_lima_is_kept(paid_at: str, paid_on: date) -> None:
+    extraction, _ = run(answer(paid_at=paid_at))
+
+    assert extraction.paid_on == paid_on
+
+
+def test_receipt_date_range_follows_the_injected_clock() -> None:
+    extraction, _ = run(
+        answer(paid_at="2026-10-31"), clock=lambda: datetime(2026, 10, 30, 15, 0, tzinfo=UTC)
+    )
+
+    assert extraction.paid_on == date(2026, 10, 31)
 
 
 @pytest.mark.parametrize(
@@ -332,14 +391,37 @@ def test_operation_number_is_kept_as_ascii_digits(printed: str) -> None:
 
 @pytest.mark.parametrize(
     "printed",
-    ["¹²³⁴⁵", "١٢٣٤٥", "9" * 5000, "N° —"],
-    ids=["superscript", "arabic-indic", "5000-digits", "no-digits"],
+    ["9" * 5000, "1234567890" * 3 + "123", "N° —", "½"],
+    ids=["5000-digits", "33-digits", "no-digits", "fraction"],
 )
 def test_unusable_operation_number_is_dropped_without_raising(printed: str) -> None:
     extraction, _ = run(answer(operation_number=printed))
 
     assert extraction.status is ExtractionStatus.OK
     assert extraction.reference is None
+
+
+@pytest.mark.parametrize(
+    "printed", ["123456789", "1234567890" * 3 + "12"], ids=["9-digits", "32-digits"]
+)
+def test_operation_number_up_to_32_digits_is_kept(printed: str) -> None:
+    extraction, _ = run(answer(operation_number=printed))
+
+    assert extraction.status is ExtractionStatus.OK
+    assert extraction.reference == printed
+
+
+@pytest.mark.parametrize(
+    "printed",
+    ["１２３４５", "1２345", "١٢٣٤٥", "۱۲۳۴۵", "¹²³⁴⁵"],
+    ids=["fullwidth", "mixed-fullwidth", "arabic-indic", "persian", "superscript"],
+)
+def test_operation_number_in_another_digit_script_becomes_ascii_digits(printed: str) -> None:
+    """Converted, never dropped: dropping "２" from "1２345" would leave a wrong "1345"."""
+    extraction, _ = run(answer(operation_number=printed))
+
+    assert extraction.status is ExtractionStatus.OK
+    assert extraction.reference == "12345"
 
 
 # --- amounts that must be confirmed by the user ---------------------------------------
@@ -358,7 +440,9 @@ def test_amount_below_high_confidence_needs_confirmation(confidence: str) -> Non
     assert confidence in extraction.error
 
 
-@pytest.mark.parametrize(("amount", "code"), [("987", "987"), ("9.87", "987"), ("5", "005")])
+@pytest.mark.parametrize(
+    ("amount", "code"), [("987", "987"), ("9.87", "987"), ("5", "005"), ("987", "９８７")]
+)
 def test_amount_with_the_security_code_digits_needs_confirmation(amount: str, code: str) -> None:
     extraction, _ = run(answer(amount=amount, security_code=code))
 
@@ -438,6 +522,11 @@ def test_amount_above_the_ledger_cap_is_unreadable(amount: str) -> None:
         ("12345", "0001 2345"),
         ("12345", "N° 00012345"),
         ("12345", "0001-2345"),
+        ("123.45", "0" * 28 + "12345"),
+        ("123.45", "0" * 100_000 + "12345"),
+        ("123.45", "１２３４５"),
+        ("123.45", "1２345"),
+        ("12345", "١٢٣٤٥"),
     ],
 )
 def test_amount_with_the_operation_number_digits_is_unreadable(
@@ -506,6 +595,35 @@ def test_invalid_json_fails_and_keeps_the_raw_output() -> None:
     assert extraction.raw_json == "The amount is S/ 250"
 
 
+def test_a_repeated_key_fails_instead_of_keeping_its_last_value() -> None:
+    """`json.loads` keeps the last of two equal keys, so this answer would read as S/ 999."""
+    text = json.dumps(receipt_payload(amount="250"))[:-1] + ', "amount": "999"}'
+
+    extraction, _ = run(message(text))
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert extraction.amount_minor is None
+    assert extraction.error is not None
+    assert "amount" in extraction.error
+    assert extraction.raw_json == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[" * 100_000 + "]" * 100_000,
+        '{"a": ' * 100_000 + "1" + "}" * 100_000,
+        json.dumps(receipt_payload()).replace('"250"', "9" * 5000),
+    ],
+    ids=["deeply-nested-array", "deeply-nested-object", "integer-over-4300-digits"],
+)
+def test_json_the_parser_cannot_hold_fails_instead_of_raising(text: str) -> None:
+    extraction, _ = run(message(text))
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert extraction.amount_minor is None
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -517,6 +635,9 @@ def test_invalid_json_fails_and_keeps_the_raw_output() -> None:
         json.dumps(receipt_payload(confidence="certain")),
         json.dumps(receipt_payload(confidence=None)),
         json.dumps(receipt_payload(security_code=987)),
+        json.dumps(receipt_payload(confidence=["high"])),
+        json.dumps(receipt_payload(confidence={"level": "high"})),
+        json.dumps(receipt_payload(confidence=1)),
     ],
     ids=[
         "array",
@@ -527,6 +648,9 @@ def test_invalid_json_fails_and_keeps_the_raw_output() -> None:
         "unknown-confidence",
         "null-confidence",
         "numeric-security-code",
+        "list-confidence",
+        "object-confidence",
+        "numeric-confidence",
     ],
 )
 def test_output_that_breaks_the_schema_fails(text: str) -> None:
@@ -582,3 +706,45 @@ def test_overloaded_error_names_its_status_code() -> None:
 
     assert extraction.error is not None
     assert "529" in extraction.error
+
+
+# --- retryable statuses, as the real Bedrock Mantle client maps them --------------------
+
+
+def mantle_client(status_code: int) -> anthropic.AnthropicBedrockMantle:
+    """The real Mantle client over an offline transport that answers every request with
+    `status_code`. No socket is opened and no credential is read (`skip_auth`)."""
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        body = {"type": "error", "error": {"type": "api_error", "message": "provider said no"}}
+        return httpx2.Response(status_code, json=body)
+
+    return anthropic.AnthropicBedrockMantle(
+        aws_region="us-east-1",
+        base_url="https://bedrock-mantle.invalid/anthropic",
+        skip_auth=True,
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(reply)),
+    )
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504, 529])
+def test_server_errors_from_the_real_mantle_client_are_retryable(status_code: int) -> None:
+    """Mantle raises `InternalServerError` for every status from 500 up except 529
+    (`OverloadedError`); it never raises `ServiceUnavailableError` or `DeadlineExceededError`."""
+    extraction = ClaudeBedrockExtractor(mantle_client(status_code)).extract(JPEG_BYTES)
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert extraction.error is not None
+    assert "retryable" in extraction.error
+    assert str(status_code) in extraction.error
+
+
+@pytest.mark.parametrize("status_code", [400, 409, 413, 422])
+def test_client_errors_from_the_real_mantle_client_are_not_retryable(status_code: int) -> None:
+    extraction = ClaudeBedrockExtractor(mantle_client(status_code)).extract(JPEG_BYTES)
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert extraction.error is not None
+    assert "retryable" not in extraction.error
+    assert str(status_code) in extraction.error

@@ -88,6 +88,7 @@ TOKEN = "test-token-value"
         ({}, None, REGIONAL, None, None),
         ({}, "payments", REGIONAL, None, None),
         ({"ANTHROPIC_BEDROCK_MANTLE_BASE_URL": PROXY}, None, PROXY, BASE_URL_ENV, None),
+        ({"ANTHROPIC_BEDROCK_MANTLE_BASE_URL": ""}, None, "", BASE_URL_ENV, None),
         ({"AWS_BEARER_TOKEN_BEDROCK": TOKEN}, None, REGIONAL, None, "AWS_BEARER_TOKEN_BEDROCK"),
         ({"ANTHROPIC_AWS_API_KEY": TOKEN}, None, REGIONAL, None, "ANTHROPIC_AWS_API_KEY"),
         ({"AWS_BEARER_TOKEN_BEDROCK": ""}, None, REGIONAL, None, "AWS_BEARER_TOKEN_BEDROCK"),
@@ -97,6 +98,7 @@ TOKEN = "test-token-value"
         "default-chain",
         "profile",
         "base-url-override",
+        "empty-base-url-still-replaces-the-regional-endpoint",
         "bearer-token",
         "anthropic-aws-api-key",
         "empty-bearer-token-still-switches",
@@ -138,6 +140,62 @@ def test_endpoint_description_names_variables_but_never_their_secret_values() ->
         assert secret not in description
 
 
+PASSWORD_PARTS = ("pa55", "w0rd")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "user:pa55w0rd@proxy.example.test/anthropic",
+        "user:pa55w0rd@proxy.example.test/anthropic?next=https://example.test",
+        "https:user:pa55w0rd@proxy.example.test/anthropic",
+        "//user:pa55w0rd@proxy.example.test/anthropic",
+        "https://user:pa55/w0rd@proxy.example.test/anthropic",
+        "https://user:pa55?w0rd@proxy.example.test/anthropic",
+        "https://user:pa55#w0rd@proxy.example.test/anthropic",
+        "https://proxy.example.test/anthropic?key=pa55&k=w0rd",
+        "https://proxy.example.test/anthropic#pa55w0rd",
+        "ftp://user:pa55w0rd@proxy.example.test/anthropic",
+    ],
+    ids=[
+        "no-scheme",
+        "no-scheme-with-a-url-in-the-query",
+        "scheme-without-slashes",
+        "scheme-relative",
+        "slash-in-password",
+        "question-mark-in-password",
+        "hash-in-password",
+        "query",
+        "fragment",
+        "not-http",
+    ],
+)
+def test_endpoint_description_hides_credentials_in_any_url_shape(base_url: str) -> None:
+    """A URL parser ends the user part early at "/", "?" or "#", and finds no user part at
+    all without "scheme://", so the password would be printed as part of the host or path."""
+    description = resolve_endpoint(
+        BedrockSettings(region="us-east-1"), {BASE_URL_ENV: base_url}
+    ).describe()
+
+    assert BASE_URL_ENV in description
+    for part in PASSWORD_PARTS:
+        assert part not in description
+
+
+def test_endpoint_description_keeps_the_host_and_path_of_an_http_url() -> None:
+    env = {BASE_URL_ENV: "https://user:pa55w0rd@proxy.example.test/anthropic?k=v#top"}
+
+    endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), env)
+
+    assert endpoint.base_url == "https://***@proxy.example.test/anthropic?***"
+
+
+def test_endpoint_description_says_when_the_base_url_is_empty() -> None:
+    endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), {BASE_URL_ENV: ""})
+
+    assert "endpoint (empty)" in endpoint.describe()
+
+
 @pytest.mark.parametrize(
     ("profile", "auth"),
     [(None, "SigV4 with the default AWS credential chain"), ("payments", "AWS profile payments")],
@@ -165,6 +223,7 @@ SDK_ENV_NAMES = (
         ({}, None),
         ({}, "payments"),
         ({"ANTHROPIC_BEDROCK_MANTLE_BASE_URL": PROXY}, None),
+        ({"ANTHROPIC_BEDROCK_MANTLE_BASE_URL": ""}, None),
         ({"AWS_BEARER_TOKEN_BEDROCK": TOKEN}, None),
         ({"ANTHROPIC_AWS_API_KEY": TOKEN}, None),
         ({"AWS_BEARER_TOKEN_BEDROCK": TOKEN}, "payments"),
