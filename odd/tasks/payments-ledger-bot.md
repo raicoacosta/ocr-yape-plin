@@ -40,8 +40,8 @@ Telegram bot (phase 3), bulk import of `pagos/` (4), EC2 deployment (5), operati
 - [x] T2.1 — Ledger hardening from independent verification (atomic corrections/registrations, stricter DB constraints, amount cap, keyset paging, schema version). Route: delegated writer.
 - [x] T2.2 — Ledger gaps left by the independent verification of T2.1: NUL-safe text checks, effective amount bounded above, mutant-killing tests, schema version 2, concurrent first open, busy/locked and paging errors mapped at the port. Route: delegated writer (trigger: 2+ non-trivial files across adapter, port, domain, application and tests).
 - [ ] T3 — Phase 2a: extractor port, amount parsing, Claude-on-Bedrock adapter (unit-tested with fakes), labels template + eval script. Route: delegated writer (2+ non-trivial files). Status: code, tests, README and all checks done; only `.env.example` pending (writer's write was denied by permission settings).
-- [x] T3.1 — Fixes from the independent verification of T3 (`4786855`, `3faafa8`): `needs_confirmation` status, amount/reference/security-code guards, Lima wall-clock time, incremental eval results, endpoint/auth banner, labels hardening, synthetic fixtures. Route: delegated writer (trigger: 2+ non-trivial files across port, adapter, prompt, tools and tests).
-- [x] T3.2 — Gaps from the independent verification of T3.1 (`60b4e10`, `cd23b88`): `extract()` never raises on malformed answers, repeated JSON keys refused, operation-number/security-code guards see every digit (other scripts converted, cap after leading zeros), plausible receipt dates with a fixed UTC−5 offset, URL credentials never printed, eval results files created before any request, CSV formula injection neutralized, labels case/Unicode duplicates and zero amounts refused, mutant-killing tests. Route: delegated writer (trigger: 2+ non-trivial files across adapter, port, tools and tests).
+- [x] T3.1 — Fixes from the independent verification of T3 (`19d0c47`, `cfac151`): `needs_confirmation` status, amount/reference/security-code guards, Lima wall-clock time, incremental eval results, endpoint/auth banner, labels hardening, synthetic fixtures. Route: delegated writer (trigger: 2+ non-trivial files across port, adapter, prompt, tools and tests).
+- [x] T3.2 — Gaps from the independent verification of T3.1 (`e8c843f`, `981f85a`): `extract()` never raises on malformed answers, repeated JSON keys refused, operation-number/security-code guards see every digit (other scripts converted, cap after leading zeros), plausible receipt dates with a fixed UTC−5 offset, URL credentials never printed, eval results files created before any request, CSV formula injection neutralized, labels case/Unicode duplicates and zero amounts refused, mutant-killing tests. Route: delegated writer (trigger: 2+ non-trivial files across adapter, port, tools and tests).
 - [ ] T4 — Phase 2b: user confirms expected amounts for the 22 images and the eval runs against Bedrock. Blocked on: user authorization of AWS profile/region and Bedrock model access.
 
 ## Acceptance criteria
@@ -108,8 +108,8 @@ Verifier scripts re-run (copies adapted: barrier tolerates serialization, raw ti
 - arithmetic: keyset pages concatenate to the full history; no overlap when an entry arrives between pages; `history(-1)` raises `ValueError`; oversized amounts refused before any write.
 - schema mutation: 33 mutations (19 carried over from the verifier, `drop_currency_len` retired with the column check it targeted, plus 14 for the new guards): 31 killed; 2 survivors are equivalent mutants (`drop_unique_hash`: the no-overwrite trigger already refuses a repeated hash; `drop_kind_enum`: `entry_kind_shape` already restricts `kind`).
 - Final checks: `uv run pytest -q` → 346 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 51 files already formatted.
-- Commits: `ae1fbc2` (`fix(ledger): make corrections and registrations atomic`, 492+/37−) and `ec274d3` (`fix(ledger): harden schema constraints and paging`, ≈442+/44− plus this document). Both above the ~400-line heuristic; over half of each is tests.
-- Independent verification (isolated export of `ae1fbc2` + `ec274d3`): 346 passed, concurrency tests stable, 32/35 mutants killed; of the 7 original findings 5 fixed and 2 partial. Every remaining gap moved to T2.2.
+- Commits: `f82a37a` (`fix(ledger): make corrections and registrations atomic`, 492+/37−) and `a82478c` (`fix(ledger): harden schema constraints and paging`, ≈442+/44− plus this document). Both above the ~400-line heuristic; over half of each is tests.
+- Independent verification (isolated export of `f82a37a` + `a82478c`): 346 passed, concurrency tests stable, 32/35 mutants killed; of the 7 original findings 5 fixed and 2 partial. Every remaining gap moved to T2.2.
 
 ### T2.2 — ledger gaps from the independent verification of T2.1 (done)
 
@@ -127,7 +127,7 @@ Test-first (work unit 1: items 1, 3, 4, 6):
 
 - RED 23 failed / 194 passed (adapter + domain): NUL rows accepted, non-UTF-8 read failing, upper bound missing, version still 1, domain accepting NUL and lone surrogates. Already passing before (characterization, mutant killers): first overshoot below zero, `huge-negative` payment row, `kind`/`source` with NUL, adjustment lower bound. GREEN: suite 489 passed.
 - Targeted mutation run on a copy (scratch script): 14/14 killed — `LEFT JOIN`→`JOIN`, `BETWEEN -max - 1`, NUL check removed everywhere / from currency / hash / timestamps / free-text columns, upper bound `+ 1` and removed, lower bound removed, version 1 accepted, text decoding strict, domain NUL check and UTF-8 check removed.
-- Commit: `67bb257` (`fix(ledger): refuse NUL text and out-of-range effective amounts in the schema`, 231+/27−).
+- Commit: `8949486` (`fix(ledger): refuse NUL text and out-of-range effective amounts in the schema`, 231+/27−).
 
 Test-first (work unit 2: items 2 and 5; interface-only stubs first — `LedgerBusyError`, the `busy_timeout` keyword, `MAX_HISTORY_PAGE`/`MAX_ENTRY_ID` — so RED is behavioral):
 
@@ -135,7 +135,7 @@ Test-first (work unit 2: items 2 and 5; interface-only stubs first — `LedgerBu
 - Concurrency tests: the retry test is deterministic (the holder's lock is released from the patched pause, so it also proves a retry happened); the timeout tests use `busy_timeout` 0.1–0.2 s with the lock held throughout; the race test opens 20 new files from 8 threads released by a barrier. `TestBusyDatabase` + `tests/application/test_concurrency.py` repeated 15×: 15/15 runs passed (10 tests each). The verifier's process-based `open_race.py` re-run: 2 and 8 fresh openers, 3 trials each, all opened (was 1/2 and 7/8 failing).
 - Targeted mutation run: 14/14 killed (open retry removed, busy mapping removed, `append`/`BEGIN` unmapped, adapter type/`bool`/range/`before_id` checks removed, application type/range/page-max/entry-range/entry-type checks removed). Retry-forever (deadline ignored) hangs the timeout test, caught only by the scratch script's 120 s limit; no pytest timeout plugin is installed.
 - Final checks: `uv run --frozen pytest -q` → 519 passed; `uv run --frozen ruff check .` → All checks passed; `uv run --frozen ruff format --check .` → 51 files already formatted.
-- Commits: `67bb257` (unit 1) and `0e6e985` (`fix(ledger): wait out locks on first open and map busy and paging errors`, unit 2, this document). Not changed: `created_by` beyond int64 still raises `OverflowError` on append (Telegram ids are far below it; the phase 3 bot owns that input).
+- Commits: `8949486` (unit 1) and `f55fd4f` (`fix(ledger): wait out locks on first open and map busy and paging errors`, unit 2, this document). Not changed: `created_by` beyond int64 still raises `OverflowError` on append (Telegram ids are far below it; the phase 3 bot owns that input).
 - Independent verification pending.
 
 ### T3 — extractor + eval harness (checks green; `.env.example` pending)
@@ -150,7 +150,7 @@ Test-first (work unit 2: items 2 and 5; interface-only stubs first — `LedgerBu
   - port + adapter: RED 3 collection errors (`ModuleNotFoundError: payments_bot.ports.amount_extractor`, `...adapters.extraction.claude_bedrock`) → GREEN 90 passed; suite without tools 214 passed.
   - tools: RED 3 collection errors (`ModuleNotFoundError: payments_bot.tools.labels`, `...tools.eval_extractor`) → GREEN 39 passed.
 - Final checks: `uv run pytest -q` → 253 passed; `uv run ruff check .` → All checks passed; `uv run ruff format --check .` → 49 files already formatted; `make_labels --help` and `eval_extractor --help` → exit 0. No remote call was made; all tests are offline.
-- Commits: `4786855` (port + Bedrock adapter), `3faafa8` (labels template + eval harness).
+- Commits: `19d0c47` (port + Bedrock adapter), `cfac151` (labels template + eval harness).
 - Work units: (1) port + Bedrock adapter, (2) labels template + eval harness + README. Size is above the ~400-line heuristic (about 1160 and 1150 authored lines, excluding `uv.lock`; over half of it tests); each commit is one coherent behavior.
 - Pending: `.env.example` listing `AWS_REGION=` with `AWS_PROFILE`, `EXTRACTOR_MODEL`, `EXTRACTOR_EFFORT` commented out (an empty `AWS_PROFILE` would reach the AWS SDK).
 
@@ -172,9 +172,9 @@ Test-first, two work units (interface-only stubs added before RED where collecti
 - Extraction contract: `parse_amount` RED 4 failed / 28 passed (over-long input not refused) → GREEN 32 passed. Port + adapter + prompt RED 88 failed / 68 passed → GREEN; eval `paid_on` column RED 1 failed (`KeyError: 'paid_on'`) → GREEN; suite 417 passed. Already passing before (characterization, no RED): unknown extra key and unknown confidence → `failed`.
 - Eval and labels tooling: RED 53 failed / 39 passed (tools + settings) → GREEN; suite 460 passed. Already passing before: `../x.jpeg`, `sub/x.jpeg`, `/tmp/x.jpeg` label names. Mutation check: removing the per-row `flush()` makes the crash test fail (`assert 'a.jpeg' in ''`), so it proves rows reach disk before the next request.
 - Final checks: `uv run --frozen pytest -q` → 460 passed; `uv run --frozen ruff check .` → All checks passed; `uv run --frozen ruff format --check .` → all files formatted; `rg` for the real operation number over tracked files (excluding `.venv`, `.git`) → no output; both tools' `--help` exit 0. No remote call was made.
-- Commits: `60b4e10` (`fix(extraction): ask for confirmation instead of trusting doubtful amounts`, 600+/113−) and `cd23b88` (`fix(eval): keep paid results and show the real endpoint before sending`; tools, labels, README, this document). Above the ~400-line heuristic; over half is tests.
-- Not changed (outside this task): the real operation number still exists in the history of `4786855`/`3faafa8` (history is not rewritten); refusal-fallback middleware stays a phase 3 decision.
-- Verified independently (isolated export of `60b4e10` + `cd23b88`, 460 passed, also with sockets blocked): all 13 fixes hold and no path leads to a wrong auto-recordable amount. 2 minor findings and 6 nits moved to T3.2.
+- Commits: `e8c843f` (`fix(extraction): ask for confirmation instead of trusting doubtful amounts`, 600+/113−) and `981f85a` (`fix(eval): keep paid results and show the real endpoint before sending`; tools, labels, README, this document). Above the ~400-line heuristic; over half is tests.
+- Not changed (outside this task): refusal-fallback middleware stays a phase 3 decision. The real operation number and receipt time that remained in the history of `19d0c47`/`e8c843f` were scrubbed by the history rewrite below.
+- Verified independently (isolated export of `e8c843f` + `981f85a`, 460 passed, also with sockets blocked): all 13 fixes hold and no path leads to a wrong auto-recordable amount. 2 minor findings and 6 nits moved to T3.2.
 
 ### T3.2 — gaps from the independent verification of T3.1 (done)
 
@@ -197,8 +197,15 @@ Test-first, two work units (an interface-only `clock` keyword was added before R
 - Extraction (items 1, 3, 4, 5, 8, 9): RED 29 failed / 200 passed (extraction tests) — list/dict confidence and both parser limits raising, repeated key read as 999, zero-padded / fullwidth / mixed / Arabic-Indic operation numbers not caught, other-script references dropped, fullwidth security code not caught, out-of-range dates kept, zone-database offset, five URL shapes leaking the password. Already passing before (characterization, mutant killers): 9-/32-/33-digit references, `½`, empty base URL (table and drift), whole prompt sentence, numeric confidence, the Mantle 5xx/4xx mapping, scheme-relative/query/fragment/`ftp` URLs, in-range dates. GREEN: extraction 230 passed; suite 574 passed. Targeted mutation run (scratch script, in place with restore): 21/21 killed after adding one case (the `http(s)`-only rule first survived; a scheme-less URL with `://` in its query now pins it).
 - Eval and labels (items 2, 6, 7): RED 18 failed / 64 passed (tool tests) — formula cells written verbatim (6 triggers and the file name), results files created per model after the extractor was built, `SetupError` and `OSError` escaping `main`, case/NFC/NFD duplicates accepted, zero accepted. Already passing before: plain text unchanged. GREEN: tools 82 passed. Targeted mutation run: 10/10 killed (escape removed, tab/CR/minus triggers removed, no cleanup, `OSError` not converted, `SetupError` not caught, case or normalization ignored, zero accepted).
 - Final checks: `uv run --frozen pytest -q` → 593 passed; `uv run --frozen ruff check .` → All checks passed; `uv run --frozen ruff format --check .` → 51 files already formatted; `rg` for the real operation number over the tree (excluding `.venv`, `.git`) → no output; both tools' `--help` exit 0. No remote call was made.
-- Commits: `3a87ec4` (`fix(extraction): keep every malformed answer a failed result and guard all printed digits`, 331+/50−) and the following `fix(eval): create results files before sending and keep spreadsheet formulas inert` (tools, labels, README, this document).
+- Commits: `a148c0d` (`fix(extraction): keep every malformed answer a failed result and guard all printed digits`, 331+/50−) and `31e5731` (`fix(eval): create results files before sending and keep spreadsheet formulas inert`; tools, labels, README, this document).
 - Independent verification pending.
+
+## History rewrite (privacy scrub, user-approved, before the first push)
+
+- Why: a real operation number and receipt time from the user's own receipt had been copied into prompt examples and test fixtures (T3, removed in T3.1) and were still readable in the local history. Nothing had been pushed.
+- How: `git filter-repo --force --replace-text` replaced those values with synthetic ones (`00012345`, `2026-01-15T09:30:00` and its variants) in every blob; commit messages had no occurrence. A pre-rewrite bundle was kept outside the repository as a temporary safety net.
+- Check: `git cat-file --batch-all-objects --batch` (all objects, reachable or not) → 0 matches for the scrubbed values.
+- Commit ids from `19d0c47` onward changed; every id in this document was updated (`451bff2` and `9875869` are unchanged). Remote `origin` = `https://github.com/raicoacosta/ocr-yape-plin.git` (re-added after the rewrite; push still pending).
 
 ## Next step
 
