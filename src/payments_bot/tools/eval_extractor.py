@@ -6,8 +6,9 @@ This SENDS every labeled receipt image to Amazon Bedrock, once per model. Withou
 prints what it would send, including the endpoint and auth mode the SDK will use. Every check
 that needs no network (labels, image hashes, settings, and creating every model's results file)
 runs first, so a typo never costs a request. Results go to data/eval/ (git-ignored) one row at
-a time, so a run that stops halfway keeps every answer already paid for. A text cell that a
-spreadsheet would run as a formula is written with a leading apostrophe.
+a time, so a run that stops halfway keeps every answer already paid for. A formula character
+that would start a spreadsheet cell, also where a ";" or a line break starts one, is written
+after an apostrophe, and a character no UTF-8 file can hold is written as a backslash escape.
 """
 
 import argparse
@@ -75,6 +76,22 @@ NUMBER_COLUMNS = frozenset({"expected_amount", "got_amount", "input_tokens", "ou
 """Written as plain numbers; every other result column is text."""
 FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 """A spreadsheet runs a cell that starts with one of these as a formula (CSV injection)."""
+CELL_BREAKS = (";", "\r", "\n")
+"""Where a spreadsheet may start a new cell inside one text cell of this comma-separated file:
+Excel in locales whose list separator is ";" (Spanish ones among them) splits every line on
+";", and a line break inside a quoted cell can end the row there."""
+_FORMULA_CELL_START = re.compile(
+    "(?:^|(?<=[{breaks}]))(?=[{starts}])".format(
+        breaks=re.escape("".join(CELL_BREAKS)),
+        starts=re.escape("".join(FORMULA_TRIGGERS) + '"'),
+    )
+)
+"""Every place a cell may start (the text's start or right after a cell break) followed by a
+formula character, or by a double quote: a cell that starts with one is read as quoted, so its
+value starts after it."""
+ENCODING_ERRORS = "backslashreplace"
+"""In results files and the printed table, a character no UTF-8 text can hold (a lone
+surrogate) is written as "\\ud800" instead of stopping a run whose requests are paid for."""
 TABLE_COLUMNS = ("file", "expected", "got", "match", "status", "confidence")
 
 
@@ -328,7 +345,7 @@ def evaluate(
         outcomes.append(outcome)
         writer.writerow(_result_row(outcome))
         handle.flush()
-        print(_table_row(_table_cells(outcome), widths), flush=True)
+        print(_printable(_table_row(_table_cells(outcome), widths)), flush=True)
     score = Score.of(settings.model, outcomes)
     print(score.describe())
     return score
@@ -342,8 +359,8 @@ def open_results_files(
 ) -> list[tuple[Path, TextIO]]:
     """Create every model's results file, with its header row, before anything is sent: a
     name the file system refuses must not surface after earlier models' requests were paid
-    for. If one cannot be created, the files created here are removed and `SetupError` is
-    raised."""
+    for. If one cannot be created, `SetupError` is raised; whatever stops the setup (an
+    interrupt included), the files created here are closed and removed before it propagates."""
     created: list[tuple[Path, TextIO]] = []
     try:
         for settings in runs:
@@ -355,7 +372,7 @@ def open_results_files(
                 handle.flush()
             except OSError as exc:
                 raise SetupError(f"cannot write results file {path}: {exc.strerror}") from None
-    except SetupError:
+    except BaseException:
         for path, handle in created:
             handle.close()
             path.unlink(missing_ok=True)
@@ -369,7 +386,7 @@ def create_results_file(stem: Path, new_suffix: Callable[[], str]) -> tuple[Path
     for _ in range(RESULT_NAME_ATTEMPTS):
         path = stem.with_name(f"{stem.name}-{new_suffix()}.csv")
         try:
-            return path, path.open("x", encoding=CSV_ENCODING, newline="")
+            return path, path.open("x", encoding=CSV_ENCODING, errors=ENCODING_ERRORS, newline="")
         except FileExistsError:
             continue
         except OSError as exc:
@@ -410,10 +427,17 @@ def _result_row(outcome: Outcome) -> dict[str, str]:
 
 
 def _text_cell(text: str) -> str:
-    """`text` as a spreadsheet shows it, never runs it: an apostrophe before a leading
-    formula character makes the cell plain text. The image can steer the model's text, and
-    the results file opens in spreadsheet apps."""
-    return f"'{text}" if text.startswith(FORMULA_TRIGGERS) else text
+    """`text` as a spreadsheet shows it, never runs it, whether the spreadsheet splits lines
+    on "," or on ";". An apostrophe goes before every formula character (or double quote) that
+    starts the text or follows a ";" or a line break: "Yape;=1+1" is written "Yape;'=1+1", so
+    neither the whole cell nor the ";"-separated piece "'=1+1" is a formula. The image can
+    steer the model's text, and the results file opens in spreadsheet apps."""
+    return _FORMULA_CELL_START.sub("'", text)
+
+
+def _printable(text: str) -> str:
+    """`text` with any character no UTF-8 text can hold written as a backslash escape."""
+    return text.encode("utf-8", ENCODING_ERRORS).decode("utf-8")
 
 
 def _table_cells(outcome: Outcome) -> tuple[str, ...]:

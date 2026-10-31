@@ -6,13 +6,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import TextIO
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from payments_bot.adapters.extraction.claude_bedrock import BedrockSettings
 from payments_bot.ports.amount_extractor import Extraction, ExtractionStatus, TokenUsage
-from payments_bot.tools.eval_extractor import main
+from payments_bot.tools import eval_extractor
+from payments_bot.tools.eval_extractor import FORMULA_TRIGGERS, RESULT_COLUMNS, main
 from payments_bot.tools.labels import LABEL_COLUMNS
 
 OPUS = "anthropic.claude-opus-5-5"
@@ -324,6 +326,95 @@ def test_plain_text_is_written_unchanged(workspace: Workspace) -> None:
     assert {row["provider"] for row in read_rows(results)} == {"Yape"}
 
 
+SEMICOLON_OR_LINE_BREAK_FORMULAS = [
+    "Yape;=1+1;",
+    "x;+1",
+    "x;-2+3",
+    "x;@SUM(1;2)",
+    "x;\t=1",
+    "x;\r=1",
+    "x;;=1",
+    'x;"=1+1"',
+    "x\n=1+1",
+    "x\r\n@SUM(1)",
+]
+
+
+def spreadsheet_cells_split_on_semicolons(path: Path) -> list[str]:
+    """The cells a spreadsheet whose list separator is ";" may see: every physical line split
+    on ";", with no regard for quotes. A cell that starts with a quote is read as quoted, so
+    its value starts after the quote."""
+    text = path.read_text(encoding="utf-8-sig")
+    return [cell.lstrip('"') for line in re.split(r"[\r\n]", text) for cell in line.split(";")]
+
+
+@pytest.mark.parametrize("text", SEMICOLON_OR_LINE_BREAK_FORMULAS)
+def test_results_csv_keeps_formulas_inert_where_a_semicolon_or_line_break_starts_a_cell(
+    workspace: Workspace, text: str
+) -> None:
+    """Excel in locales whose list separator is ";" (Spanish ones among them) splits every
+    line on ";", and a line break inside a quoted cell may start a new row there, so a
+    formula character after either one would start a formula cell."""
+    results = run_text_extractor(
+        workspace, lambda model: TextExtractor(model, provider=text, error=text, raw_json=text)
+    )
+
+    for cell in spreadsheet_cells_split_on_semicolons(results):
+        assert not cell.startswith(FORMULA_TRIGGERS), cell
+
+
+def test_results_csv_escapes_only_what_follows_a_cell_break(workspace: Workspace) -> None:
+    results = run_text_extractor(
+        workspace, lambda model: TextExtractor(model, provider="Yape;=1+1; ok;x\n-1")
+    )
+
+    assert {row["provider"] for row in read_rows(results)} == {"Yape;'=1+1; ok;x\n'-1"}
+
+
+def test_number_columns_are_written_unchanged_even_when_they_look_like_a_formula(
+    workspace: Workspace,
+) -> None:
+    class NegativeUsageExtractor:
+        def extract(self, image: bytes) -> Extraction:
+            return Extraction(status=ExtractionStatus.FAILED, model=OPUS, usage=TokenUsage(-5, -7))
+
+    main(
+        workspace.args("--yes"),
+        env=ENV,
+        extractor_factory=lambda settings: NegativeUsageExtractor(),
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+
+    (results,) = workspace.result_files()
+    rows = read_rows(results)
+    assert {(row["input_tokens"], row["output_tokens"]) for row in rows} == {("-5", "-7")}
+
+
+def test_text_no_utf8_writer_can_encode_is_kept_escaped_and_the_run_goes_on(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lone surrogate must not crash a paid run: the strict writer would raise after the
+    request was paid for and lose the rows still to come."""
+    exit_code = main(
+        workspace.args("--yes", "--model", OPUS, "--model", HAIKU),
+        env=ENV,
+        extractor_factory=lambda settings: TextExtractor(
+            settings.model, provider="\ud800Yape", error="no \udfff"
+        ),
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+
+    assert exit_code == 0
+    assert "\\udfff" in capsys.readouterr().out
+    for path in workspace.result_files():
+        rows = read_rows(path)
+        assert [(row["provider"], row["error"]) for row in rows] == [
+            ("\\ud800Yape", "no \\udfff")
+        ] * 3
+
+
 def test_several_models_are_evaluated_side_by_side(
     workspace: Workspace, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -555,6 +646,124 @@ def test_every_results_file_exists_before_the_first_request(workspace: Workspace
         assert len(read_rows(path)) == 3
 
 
+HEADER_LINE = ",".join(RESULT_COLUMNS) + "\r\n"
+
+
+def test_every_header_row_is_on_disk_before_the_first_request(workspace: Workspace) -> None:
+    """A run that stops at its first request still leaves files a spreadsheet can open."""
+    on_disk_at_first_request: list[list[str]] = []
+    factory = answers()
+
+    class SpyingExtractor:
+        def __init__(self, settings: BedrockSettings) -> None:
+            self._inner = factory(settings)
+
+        def extract(self, image: bytes) -> Extraction:
+            if not on_disk_at_first_request:
+                on_disk_at_first_request.append(
+                    [
+                        path.read_text(encoding="utf-8-sig", newline="")
+                        for path in workspace.result_files()
+                    ]
+                )
+            return self._inner.extract(image)
+
+    main(
+        workspace.args("--yes", "--model", OPUS, "--model", HAIKU),
+        env=ENV,
+        extractor_factory=SpyingExtractor,
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+
+    assert on_disk_at_first_request == [[HEADER_LINE, HEADER_LINE]]
+
+
+@pytest.fixture
+def opened_handles(monkeypatch: pytest.MonkeyPatch) -> list[TextIO]:
+    """Every results file handle the run creates, to check that it is closed."""
+    handles: list[TextIO] = []
+    create = eval_extractor.create_results_file
+
+    def recording_create(stem: Path, new_suffix: Callable[[], str]) -> tuple[Path, TextIO]:
+        path, handle = create(stem, new_suffix)
+        handles.append(handle)
+        return path, handle
+
+    monkeypatch.setattr(eval_extractor, "create_results_file", recording_create)
+    return handles
+
+
+def test_results_files_are_closed_when_the_run_ends(
+    workspace: Workspace, opened_handles: list[TextIO]
+) -> None:
+    exit_code, _ = run(workspace, "--yes", "--model", OPUS, "--model", HAIKU)
+
+    assert exit_code == 0
+    assert len(opened_handles) == 2
+    assert all(handle.closed for handle in opened_handles)
+
+
+def test_results_files_are_closed_when_an_extractor_raises(
+    workspace: Workspace, opened_handles: list[TextIO]
+) -> None:
+    def factory(settings: BedrockSettings) -> CrashingExtractor:
+        return CrashingExtractor(settings.model, workspace.results)
+
+    with pytest.raises(RuntimeError, match="credentials"):
+        main(
+            workspace.args("--yes", "--model", OPUS, "--model", HAIKU),
+            env=ENV,
+            extractor_factory=factory,
+            clock=lambda: FIXED_NOW,
+            new_suffix=counting_suffixes(),
+        )
+
+    assert len(opened_handles) == 2
+    assert all(handle.closed for handle in opened_handles)
+
+
+def test_results_files_created_before_a_setup_failure_are_closed_and_removed(
+    workspace: Workspace, opened_handles: list[TextIO]
+) -> None:
+    exit_code, factory = run(
+        workspace, "--yes", "--model", OPUS, "--model", "anthropic." + "x" * 290
+    )
+
+    assert exit_code == 2
+    assert factory.settings == []
+    assert len(opened_handles) == 1
+    assert opened_handles[0].closed
+    assert workspace.result_files() == []
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("suffix source failed"), KeyboardInterrupt()])
+def test_any_failure_while_creating_results_files_removes_the_files_of_this_run(
+    workspace: Workspace, opened_handles: list[TextIO], failure: BaseException
+) -> None:
+    """Not only `SetupError`: whatever stops the setup, no empty results file is left."""
+    suffixes = iter(["000001"])
+
+    def failing_suffix() -> str:
+        try:
+            return next(suffixes)
+        except StopIteration:
+            raise failure from None
+
+    with pytest.raises(type(failure)):
+        main(
+            workspace.args("--yes", "--model", OPUS, "--model", HAIKU),
+            env=ENV,
+            extractor_factory=answers(),
+            clock=lambda: FIXED_NOW,
+            new_suffix=failing_suffix,
+        )
+
+    assert len(opened_handles) == 1
+    assert opened_handles[0].closed
+    assert workspace.result_files() == []
+
+
 def test_a_results_name_collision_stops_before_any_request_and_leaves_no_new_file(
     workspace: Workspace, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -588,6 +797,7 @@ def test_a_results_file_name_the_file_system_refuses_stops_before_any_request(
     assert exit_code == 2
     assert err.startswith("error: ")
     assert "results file" in err
+    assert "nothing was sent" in err
     assert "Traceback" not in err
     assert factory.settings == []
     assert workspace.result_files() == []

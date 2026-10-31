@@ -95,9 +95,12 @@ that is not a valid `http` or `https` URL with a host is not shown at all.
    stops halfway (for example on an AWS credential error) keeps every answer already paid for.
    Every model's results file is created before the first image is sent, so a file that cannot
    be created stops the run with nothing spent. Only `ok` answers count as matches;
-   `needs_confirmation` rows keep their candidate amount for review. A text cell that starts
-   with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a
-   spreadsheet shows it instead of running it as a formula (the model's text can be steered by
-   the image).
+   `needs_confirmation` rows keep their candidate amount for review. In text cells, a `=`, `+`,
+   `-`, `@`, tab, carriage return or double quote that starts the cell or follows a `;` or a
+   line break is written after a `'`, so a spreadsheet shows it instead of running it as a
+   formula, also when it splits lines on `;` as Excel does in Spanish locales (the model's text
+   can be steered by the image): `Yape;=1+1` is written `Yape;'=1+1`. Number columns are
+   written unchanged. A character no UTF-8 file can hold is written as a backslash escape
+   (`\ud800`) instead of stopping the run.
 
 `pagos/` and `data/` are git-ignored, so receipts, labels and results are never committed.

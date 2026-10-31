@@ -136,13 +136,25 @@ def nfd(text: str) -> str:
         ("a.jpeg", "a.JPEG"),
         (nfc("pagó.jpeg"), nfd("pagó.jpeg")),
         (nfd("pagó.jpeg"), nfc("PAGÓ.jpeg")),
+        ("straße.jpeg", "strasse.jpeg"),
+        ("ᾄ.jpeg", nfc("ᾄ.jpeg")),
     ],
-    ids=["case", "suffix-case", "nfc-then-nfd", "nfd-then-upper-nfc"],
+    ids=[
+        "case",
+        "suffix-case",
+        "nfc-then-nfd",
+        "nfd-then-upper-nfc",
+        "full-case-folding",
+        "decompose-before-folding",
+    ],
 )
 def test_read_labels_refuses_the_same_file_under_another_case_or_unicode_form(
     tmp_path: Path, listed: str, again: str
 ) -> None:
-    """macOS file systems ignore case and Unicode normalization: both rows name one image."""
+    """macOS file systems ignore case and Unicode normalization: both rows name one image.
+    "ß" folds to "ss" only with full case folding (`casefold`, not `lower`), and a combining
+    mark that folds to a letter (the Greek ypogegrammeni) needs decomposition before folding,
+    as Unicode's canonical caseless match does."""
     assert listed != again
     csv_path = tmp_path / "labels.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
