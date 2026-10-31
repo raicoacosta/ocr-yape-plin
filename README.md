@@ -15,10 +15,11 @@ uv run ruff check .
 Claude on Amazon Bedrock and returns an `Extraction` with an explicit status:
 
 - `ok`: amount in céntimos (`S/ 250` → `25000`, `S/ 40.00` → `4000`), currency (`PEN` or
-  `USD`), operation number (ASCII digits), payment date (`paid_on`) and, when the receipt prints
-  one, time (`paid_at`, always read as Lima wall-clock time), provider and confidence. Only a
-  high-confidence amount that passes every check is `ok`, and `ok` is the only status that may
-  be recorded without asking.
+  `USD`), operation number (ASCII digits; digits of other scripts are converted), payment date
+  (`paid_on`) and, when the receipt prints one, time (`paid_at`, always read as Lima wall-clock
+  time, UTC−5), provider and confidence. A date before 2016 or after tomorrow is a misread and
+  is left empty. Only a high-confidence amount that passes every check is `ok`, and `ok` is the
+  only status that may be recorded without asking.
 - `needs_confirmation`: a candidate amount and currency that must **never be recorded
   automatically**. The model was not highly confident, or the amount repeats the receipt's
   security code. The bot shows the candidate and records only what the user confirms.
@@ -55,7 +56,8 @@ receipts go or how requests are authenticated:
   bearer token, unless `AWS_PROFILE` is set. Even an empty value switches it.
 
 The eval prints the resolved endpoint and auth mode before anything is sent (variable names
-only, never their values).
+only, never their values; a URL's user, password and query string are masked, and a URL that
+is not `http` or `https` is not shown at all).
 
 ### Evaluate it on real receipts
 
@@ -72,8 +74,9 @@ only, never their values).
    that adds fees): `250`, `250.00` and `250,00` are all accepted. Leave `expected_currency` as
    `PEN` unless the receipt uses another currency. Rows without an amount are skipped. Do not
    edit `file` or `sha256`: the eval refuses to score an image whose hash no longer matches, a
-   file listed twice, or a file name with a directory part. Keep the file UTF-8 (in a
-   spreadsheet, save as "CSV UTF-8").
+   file listed twice (also when the names differ only in case or Unicode form, which macOS
+   treats as one file), a file name with a directory part, or an amount of zero. Keep the file
+   UTF-8 (in a spreadsheet, save as "CSV UTF-8").
 
 3. Review the plan. Without `--yes` nothing is sent. The plan shows the region, models, request
    count, endpoint and auth mode:
@@ -88,7 +91,11 @@ only, never their values).
    table plus accuracy and token totals per model, and writes
    `data/eval/results-<model>-<UTC time>-<random>.csv` one flushed row per image, so a run that
    stops halfway (for example on an AWS credential error) keeps every answer already paid for.
-   Only `ok` answers count as matches; `needs_confirmation` rows keep their candidate amount for
-   review.
+   Every model's results file is created before the first image is sent, so a file that cannot
+   be created stops the run with nothing spent. Only `ok` answers count as matches;
+   `needs_confirmation` rows keep their candidate amount for review. A text cell that starts
+   with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a
+   spreadsheet shows it instead of running it as a formula (the model's text can be steered by
+   the image).
 
 `pagos/` and `data/` are git-ignored, so receipts, labels and results are never committed.

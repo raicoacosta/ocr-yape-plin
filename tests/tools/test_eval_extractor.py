@@ -250,6 +250,80 @@ def test_results_csv_keeps_a_date_only_receipt_apart_from_a_timed_one(
     assert [row["match"] for row in rows] == ["no"] * 3
 
 
+@dataclass
+class TextExtractor:
+    """Answers every image with the same free-text fields, as a model-influenced answer can."""
+
+    model: str
+    provider: str
+    error: str = "provider error"
+    raw_json: str = "{}"
+
+    def extract(self, image: bytes) -> Extraction:
+        return Extraction(
+            status=ExtractionStatus.FAILED,
+            model=self.model,
+            provider=self.provider,
+            error=self.error,
+            raw_json=self.raw_json,
+        )
+
+
+def run_text_extractor(workspace: Workspace, extractor: Callable[[str], TextExtractor]) -> Path:
+    main(
+        workspace.args("--yes"),
+        env=ENV,
+        extractor_factory=lambda settings: extractor(settings.model),
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+    (results,) = workspace.result_files()
+    return results
+
+
+@pytest.mark.parametrize("trigger", ["=", "+", "-", "@", "\t", "\r"])
+def test_results_csv_keeps_model_text_a_spreadsheet_would_run_as_a_formula_as_text(
+    workspace: Workspace, trigger: str
+) -> None:
+    """CSV injection: the receipt image can steer the model's text, and the BOM makes
+    spreadsheet apps open the results file. A leading apostrophe makes the cell plain text."""
+    text = f'{trigger}HYPERLINK("http://example.invalid","open")'
+
+    results = run_text_extractor(
+        workspace, lambda model: TextExtractor(model, provider=text, error=text, raw_json=text)
+    )
+
+    for row in read_rows(results):
+        assert row["provider"] == f"'{text}"
+        assert row["error"] == f"'{text}"
+        assert row["raw_json"] == f"'{text}"
+
+
+def test_results_csv_keeps_a_formula_like_file_name_as_text_and_numbers_as_numbers(
+    workspace: Workspace,
+) -> None:
+    image = b"\xff\xd8\xff receipt formula"
+    name = "=1+1.jpeg"
+    (workspace.images / name).write_bytes(image)
+    write_labels(workspace.labels, [[name, hashlib.sha256(image).hexdigest(), "250", "PEN", ""]])
+
+    run(workspace, "--yes", factory=FakeFactory({image: CORRECT_A}))
+
+    (results,) = workspace.result_files()
+    (row,) = read_rows(results)
+    assert row["file"] == "'=1+1.jpeg"
+    assert row["expected_amount"] == "250.00"
+    assert row["got_amount"] == "250.00"
+    assert row["input_tokens"] == "1000"
+    assert row["provider"] == ""
+
+
+def test_plain_text_is_written_unchanged(workspace: Workspace) -> None:
+    results = run_text_extractor(workspace, lambda model: TextExtractor(model, provider="Yape"))
+
+    assert {row["provider"] for row in read_rows(results)} == {"Yape"}
+
+
 def test_several_models_are_evaluated_side_by_side(
     workspace: Workspace, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -450,6 +524,73 @@ def test_results_are_written_row_by_row_so_a_crash_keeps_what_was_paid_for(
         ("a.jpeg", "250.00", "yes")
     ]
     assert str(results) in capsys.readouterr().out
+
+
+def test_every_results_file_exists_before_the_first_request(workspace: Workspace) -> None:
+    """With several models, a results file that cannot be created must surface before the
+    first model's requests are paid for, so every file is created up front."""
+    on_disk_at_first_extractor: list[list[str]] = []
+    factory = answers()
+
+    def spying_factory(settings: BedrockSettings) -> FakeExtractor:
+        if not on_disk_at_first_extractor:
+            on_disk_at_first_extractor.append([path.name for path in workspace.result_files()])
+        return factory(settings)
+
+    main(
+        workspace.args("--yes", "--model", OPUS, "--model", HAIKU),
+        env=ENV,
+        extractor_factory=spying_factory,
+        clock=lambda: FIXED_NOW,
+        new_suffix=counting_suffixes(),
+    )
+
+    assert on_disk_at_first_extractor == [
+        [
+            f"results-{HAIKU}-20261029T150000Z-000002.csv",
+            f"results-{OPUS}-20261029T150000Z-000001.csv",
+        ]
+    ]
+    for path in workspace.result_files():
+        assert len(read_rows(path)) == 3
+
+
+def test_a_results_name_collision_stops_before_any_request_and_leaves_no_new_file(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The second model's five candidate names are taken: nothing may have been sent for the
+    first model by then, and the first model's new (empty) file is removed again."""
+    workspace.results.mkdir()
+    taken = [
+        workspace.results / f"results-{HAIKU}-20261029T150000Z-{number:06d}.csv"
+        for number in range(2, 7)
+    ]
+    for path in taken:
+        path.write_text("an earlier run")
+
+    exit_code, factory = run(workspace, "--yes", "--model", OPUS, "--model", HAIKU)
+
+    assert exit_code == 2
+    assert "results file" in capsys.readouterr().err
+    assert factory.settings == []
+    assert workspace.result_files() == taken
+    assert all(path.read_text() == "an earlier run" for path in taken)
+
+
+def test_a_results_file_name_the_file_system_refuses_stops_before_any_request(
+    workspace: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    long_model = "anthropic." + "x" * 290
+
+    exit_code, factory = run(workspace, "--yes", "--model", OPUS, "--model", long_model)
+
+    err = capsys.readouterr().err
+    assert exit_code == 2
+    assert err.startswith("error: ")
+    assert "results file" in err
+    assert "Traceback" not in err
+    assert factory.settings == []
+    assert workspace.result_files() == []
 
 
 def test_unwritable_results_directory_stops_before_any_call(

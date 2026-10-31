@@ -4,9 +4,10 @@
 
 This SENDS every labeled receipt image to Amazon Bedrock, once per model. Without --yes it only
 prints what it would send, including the endpoint and auth mode the SDK will use. Every check
-that needs no network (labels, image hashes, settings, results directory) runs first, so a typo
-never costs a request. Results go to data/eval/ (git-ignored) one row at a time, so a run that
-stops halfway keeps every answer already paid for.
+that needs no network (labels, image hashes, settings, and creating every model's results file)
+runs first, so a typo never costs a request. Results go to data/eval/ (git-ignored) one row at
+a time, so a run that stops halfway keeps every answer already paid for. A text cell that a
+spreadsheet would run as a formula is written with a leading apostrophe.
 """
 
 import argparse
@@ -16,6 +17,7 @@ import re
 import secrets
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
@@ -69,6 +71,10 @@ RESULT_COLUMNS = (
     "error",
     "raw_json",
 )
+NUMBER_COLUMNS = frozenset({"expected_amount", "got_amount", "input_tokens", "output_tokens"})
+"""Written as plain numbers; every other result column is text."""
+FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+"""A spreadsheet runs a cell that starts with one of these as a formula (CSV injection)."""
 TABLE_COLUMNS = ("file", "expected", "got", "match", "status", "confidence")
 
 
@@ -216,11 +222,18 @@ def main(
         return 0
 
     timestamp = clock().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    stems = (_results_stem(settings.model, timestamp) for settings in runs)
-    scores = [
-        evaluate(settings, cases, extractor_factory, args.results_dir / stem, new_suffix)
-        for settings, stem in zip(runs, stems, strict=True)
-    ]
+    try:
+        results = open_results_files(runs, args.results_dir, timestamp, new_suffix)
+    except SetupError as exc:
+        print(f"error: {exc}; nothing was sent", file=sys.stderr)
+        return 2
+    with ExitStack() as stack:
+        for _, handle in results:
+            stack.enter_context(handle)
+        scores = [
+            evaluate(settings, cases, extractor_factory, path, handle)
+            for settings, (path, handle) in zip(runs, results, strict=True)
+        ]
     print("\n== summary ==")
     width = max(len(score.model) for score in scores)
     for score in scores:
@@ -297,41 +310,70 @@ def evaluate(
     settings: BedrockSettings,
     cases: Sequence[Case],
     extractor_factory: ExtractorFactory,
-    results_stem: Path,
-    new_suffix: Callable[[], str],
+    path: Path,
+    handle: TextIO,
 ) -> Score:
-    """Score one model, writing and flushing each result row as soon as it is known."""
+    """Score one model, writing and flushing each result row to `handle` as soon as it is
+    known. The caller owns (and closes) `handle`."""
     extractor = extractor_factory(settings)
-    path, handle = create_results_file(results_stem, new_suffix)
     status_width = max(len(status.value) for status in ExtractionStatus)
     widths = (max(len(case.label.file) for case in cases), 10, 10, 5, status_width, 10)
     print(f"\n== {settings.model} ==")
     print(f"results (written row by row): {path}")
     print(_table_row(TABLE_COLUMNS, widths))
     outcomes = []
-    with handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
-        writer.writeheader()
-        for case in cases:
-            outcome = Outcome(case.label, extractor.extract(case.image))
-            outcomes.append(outcome)
-            writer.writerow(_result_row(outcome))
-            handle.flush()
-            print(_table_row(_table_cells(outcome), widths), flush=True)
+    writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
+    for case in cases:
+        outcome = Outcome(case.label, extractor.extract(case.image))
+        outcomes.append(outcome)
+        writer.writerow(_result_row(outcome))
+        handle.flush()
+        print(_table_row(_table_cells(outcome), widths), flush=True)
     score = Score.of(settings.model, outcomes)
     print(score.describe())
     return score
 
 
+def open_results_files(
+    runs: Sequence[BedrockSettings],
+    directory: Path,
+    timestamp: str,
+    new_suffix: Callable[[], str],
+) -> list[tuple[Path, TextIO]]:
+    """Create every model's results file, with its header row, before anything is sent: a
+    name the file system refuses must not surface after earlier models' requests were paid
+    for. If one cannot be created, the files created here are removed and `SetupError` is
+    raised."""
+    created: list[tuple[Path, TextIO]] = []
+    try:
+        for settings in runs:
+            stem = directory / _results_stem(settings.model, timestamp)
+            path, handle = create_results_file(stem, new_suffix)
+            created.append((path, handle))
+            try:
+                csv.DictWriter(handle, fieldnames=RESULT_COLUMNS).writeheader()
+                handle.flush()
+            except OSError as exc:
+                raise SetupError(f"cannot write results file {path}: {exc.strerror}") from None
+    except SetupError:
+        for path, handle in created:
+            handle.close()
+            path.unlink(missing_ok=True)
+        raise
+    return created
+
+
 def create_results_file(stem: Path, new_suffix: Callable[[], str]) -> tuple[Path, TextIO]:
     """Open a new `<stem>-<suffix>.csv` exclusively: never overwrites an earlier run's file,
-    even when two runs start in the same second."""
+    even when two runs start in the same second. Raises `SetupError` instead of `OSError`."""
     for _ in range(RESULT_NAME_ATTEMPTS):
         path = stem.with_name(f"{stem.name}-{new_suffix()}.csv")
         try:
             return path, path.open("x", encoding=CSV_ENCODING, newline="")
         except FileExistsError:
             continue
+        except OSError as exc:
+            raise SetupError(f"cannot create results file {path}: {exc.strerror}") from None
     raise SetupError(f"no unused results file name for {stem} after {RESULT_NAME_ATTEMPTS} tries")
 
 
@@ -342,7 +384,7 @@ def _results_stem(model: str, timestamp: str) -> str:
 def _result_row(outcome: Outcome) -> dict[str, str]:
     label, extraction = outcome.label, outcome.extraction
     usage = extraction.usage
-    return {
+    row = {
         "file": label.file,
         "sha256": label.sha256,
         "expected_amount": _amount(label.expected_amount_minor),
@@ -361,6 +403,17 @@ def _result_row(outcome: Outcome) -> dict[str, str]:
         "error": extraction.error or "",
         "raw_json": extraction.raw_json or "",
     }
+    return {
+        column: value if column in NUMBER_COLUMNS else _text_cell(value)
+        for column, value in row.items()
+    }
+
+
+def _text_cell(text: str) -> str:
+    """`text` as a spreadsheet shows it, never runs it: an apostrophe before a leading
+    formula character makes the cell plain text. The image can steer the model's text, and
+    the results file opens in spreadsheet apps."""
+    return f"'{text}" if text.startswith(FORMULA_TRIGGERS) else text
 
 
 def _table_cells(outcome: Outcome) -> tuple[str, ...]:

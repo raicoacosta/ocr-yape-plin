@@ -1,4 +1,5 @@
 import csv
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,13 @@ def test_expected_amount_accepts_what_a_human_types(text: str, minor: int) -> No
 @pytest.mark.parametrize("text", ["abc", "1.250,00", "1,250.00", "-5", "S/ 250", "40.555", ","])
 def test_expected_amount_rejects_ambiguous_or_malformed_text(text: str) -> None:
     with pytest.raises(LabelError):
+        parse_expected_amount(text)
+
+
+@pytest.mark.parametrize("text", ["0", "0.00", "0,00", "000"])
+def test_expected_amount_rejects_zero(text: str) -> None:
+    """No receipt shows a zero payment, and the extractor never reports one as `ok`."""
+    with pytest.raises(LabelError, match="zero"):
         parse_expected_amount(text)
 
 
@@ -110,6 +118,39 @@ def test_read_labels_refuses_a_file_listed_twice(tmp_path: Path) -> None:
     )
 
     with pytest.raises(LabelError, match=r"line 3: .*a\.jpeg.* line 2"):
+        read_labels(csv_path)
+
+
+def nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
+
+
+def nfd(text: str) -> str:
+    return unicodedata.normalize("NFD", text)
+
+
+@pytest.mark.parametrize(
+    ("listed", "again"),
+    [
+        ("a.jpeg", "A.jpeg"),
+        ("a.jpeg", "a.JPEG"),
+        (nfc("pagó.jpeg"), nfd("pagó.jpeg")),
+        (nfd("pagó.jpeg"), nfc("PAGÓ.jpeg")),
+    ],
+    ids=["case", "suffix-case", "nfc-then-nfd", "nfd-then-upper-nfc"],
+)
+def test_read_labels_refuses_the_same_file_under_another_case_or_unicode_form(
+    tmp_path: Path, listed: str, again: str
+) -> None:
+    """macOS file systems ignore case and Unicode normalization: both rows name one image."""
+    assert listed != again
+    csv_path = tmp_path / "labels.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(
+            [LABEL_COLUMNS, [listed, HASH_A, "250", "PEN", ""], [again, HASH_B, "40", "PEN", ""]]
+        )
+
+    with pytest.raises(LabelError, match=r"line 3: .* line 2"):
         read_labels(csv_path)
 
 

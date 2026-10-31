@@ -8,6 +8,7 @@ import csv
 import hashlib
 import io
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,11 +67,14 @@ def parse_expected_amount(text: str) -> int:
     if cleaned.count(",") == 1 and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
     try:
-        return parse_amount(cleaned)
+        amount_minor = parse_amount(cleaned)
     except InvalidAmountError:
         raise LabelError(
             f"expected_amount {text!r} is not an amount like 250, 250.00 or 250,00"
         ) from None
+    if amount_minor == 0:
+        raise LabelError(f"expected_amount {text!r} is zero; type the amount the receipt shows")
+    return amount_minor
 
 
 def format_minor(amount_minor: int) -> str:
@@ -100,23 +104,34 @@ def read_labels(path: Path) -> list[Label]:
     if missing:
         raise LabelError(f"{path} lacks the column(s) {', '.join(missing)}")
     labels = []
-    first_line: dict[str, int] = {}
+    first_listed: dict[str, tuple[int, str]] = {}
     for row in reader:
         cells = {column: (row.get(column) or "").strip() for column in LABEL_COLUMNS}
         if not any(cells.values()):
             continue
+        key = ""
         try:
             label = _label(cells)
-            if label.file in first_line:
+            key = _same_file_key(label.file)
+            if key in first_listed:
+                line, listed = first_listed[key]
+                spelled = "" if listed == label.file else f" as {listed!r}"
                 raise LabelError(
-                    f"{label.file!r} is already listed on line {first_line[label.file]}; "
-                    "keep one row per image"
+                    f"{label.file!r} is already listed on line {line}{spelled}; keep one row "
+                    "per image (names that differ only in case or Unicode form are one file "
+                    "on macOS)"
                 )
         except LabelError as exc:
             raise LabelError(f"{path}: line {reader.line_num}: {exc}") from None
-        first_line[label.file] = reader.line_num
+        first_listed[key] = (reader.line_num, label.file)
         labels.append(label)
     return labels
+
+
+def _same_file_key(name: str) -> str:
+    """One key for every spelling macOS treats as the same file name: case-insensitive and
+    blind to Unicode normalization ("A.jpeg" and "a.jpeg"; "ó" composed or decomposed)."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFD", name).casefold())
 
 
 def _is_bare_file_name(name: str) -> bool:
