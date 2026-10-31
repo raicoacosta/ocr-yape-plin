@@ -1,8 +1,10 @@
-"""Building the Bedrock extractor from configuration. No real client is ever constructed."""
+"""Building the Bedrock extractor from configuration. Real clients are only built offline: no
+request leaves the process and no credential is read."""
 
 from typing import Any
 
 import anthropic
+import httpx2
 import pytest
 
 from payments_bot.adapters.extraction import claude_bedrock
@@ -10,6 +12,7 @@ from payments_bot.adapters.extraction.claude_bedrock import (
     BASE_URL_ENV,
     BedrockEndpoint,
     BedrockSettings,
+    ClaudeBedrockExtractor,
     ExtractorConfigError,
     build_bedrock_extractor,
     resolve_endpoint,
@@ -156,6 +159,11 @@ PASSWORD_PARTS = ("pa55", "w0rd")
         "https://proxy.example.test/anthropic?key=pa55&k=w0rd",
         "https://proxy.example.test/anthropic#pa55w0rd",
         "ftp://user:pa55w0rd@proxy.example.test/anthropic",
+        "https://user:pa55@w0rd@proxy.example.test/anthropic",
+        "https://us@er:pa55@w0rd@proxy.example.test/anthropic",
+        "https:/user:pa55w0rd@proxy.example.test/anthropic",
+        "https://user:pa55w0rd@proxy.example.test\\@other.invalid/anthropic",
+        "https://proxy.example.test\n/pa55w0rd",
     ],
     ids=[
         "no-scheme",
@@ -168,6 +176,11 @@ PASSWORD_PARTS = ("pa55", "w0rd")
         "query",
         "fragment",
         "not-http",
+        "at-sign-in-password",
+        "at-signs-in-user-and-password",
+        "one-slash",
+        "backslash-before-the-last-at-sign",
+        "control-character",
     ],
 )
 def test_endpoint_description_hides_credentials_in_any_url_shape(base_url: str) -> None:
@@ -188,6 +201,108 @@ def test_endpoint_description_keeps_the_host_and_path_of_an_http_url() -> None:
     endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), env)
 
     assert endpoint.base_url == "https://***@proxy.example.test/anthropic?***"
+
+
+COLLECTOR = "https://collector.invalid/x@bedrock-mantle.us-east-1.api.aws/anthropic"
+"""Sends to collector.invalid: the "@" is in the path, not after a user part."""
+
+SHOWN_AS_PARSED = [
+    (COLLECTOR, COLLECTOR),
+    ("https://proxy.example.test/?redirect=a@b.invalid", "https://proxy.example.test/?***"),
+    ("https://user:pa55@w0rd@proxy.example.test/a", "https://***@proxy.example.test/a"),
+    ("HTTPS://Proxy.Example.TEST:8443/anthropic", "https://proxy.example.test:8443/anthropic"),
+    ("https://proxy.example.test:443/anthropic", "https://proxy.example.test/anthropic"),
+    ("http://proxy.example.test:80/anthropic", "http://proxy.example.test/anthropic"),
+    ("https://[::1]:8443/anthropic", "https://[::1]:8443/anthropic"),
+    ("https://user:pa55@[::1]/anthropic", "https://***@[::1]/anthropic"),
+    ("https://bücher.example.test/anthropic", "https://xn--bcher-kva.example.test/anthropic"),
+    ("https://u:pa55@proxy.example.test\\@other.invalid/a", "https://***@other.invalid/a"),
+]
+SHOWN_AS_PARSED_IDS = [
+    "at-sign-in-path",
+    "at-sign-in-query",
+    "at-signs-in-user-part",
+    "scheme-and-host-case",
+    "default-https-port",
+    "default-http-port",
+    "ipv6-with-port",
+    "ipv6-with-user",
+    "international-host",
+    "backslash-in-user-part",
+]
+
+
+@pytest.mark.parametrize(("base_url", "shown"), SHOWN_AS_PARSED, ids=SHOWN_AS_PARSED_IDS)
+def test_endpoint_shows_scheme_host_and_port_as_the_http_client_parses_them(
+    base_url: str, shown: str
+) -> None:
+    endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), {BASE_URL_ENV: base_url})
+
+    assert endpoint.base_url == shown
+
+
+NOT_HTTP = "(not an http or https URL with a host, not shown)"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "shown"),
+    [
+        ("ftp://proxy.example.test/anthropic", NOT_HTTP),
+        ("file:///etc/anthropic", NOT_HTTP),
+        ("//proxy.example.test/anthropic", NOT_HTTP),
+        ("https:/proxy.example.test/anthropic", NOT_HTTP),
+        ("https://", NOT_HTTP),
+        ("https://user:pa55/w0rd@proxy.example.test/a", "(not a valid URL, not shown)"),
+    ],
+    ids=["ftp", "file", "scheme-relative", "one-slash", "no-host", "unparsable"],
+)
+def test_endpoint_that_is_not_an_http_url_with_a_host_is_not_shown(
+    base_url: str, shown: str
+) -> None:
+    endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), {BASE_URL_ENV: base_url})
+
+    assert endpoint.base_url == shown
+
+
+def test_endpoint_with_an_at_sign_in_the_path_names_the_host_requests_go_to() -> None:
+    description = resolve_endpoint(
+        BedrockSettings(region="us-east-1"), {BASE_URL_ENV: COLLECTOR}
+    ).describe()
+
+    assert "endpoint https://collector.invalid/" in description
+    assert "***" not in description
+
+
+@pytest.mark.parametrize(("base_url", "shown"), SHOWN_AS_PARSED, ids=SHOWN_AS_PARSED_IDS)
+def test_endpoint_names_the_host_the_real_sdk_client_sends_to(
+    monkeypatch: pytest.MonkeyPatch, base_url: str, shown: str
+) -> None:
+    """Drift guard: the real client sends one request through an offline transport (no
+    socket, no credentials), and the banner must name its scheme, host and port."""
+    for name in SDK_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(BASE_URL_ENV, base_url)
+    sent: list[httpx2.URL] = []
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request.url)
+        body = {"type": "error", "error": {"type": "invalid_request_error", "message": "no"}}
+        return httpx2.Response(400, json=body)
+
+    client = anthropic.AnthropicBedrockMantle(
+        aws_region="us-east-1",
+        skip_auth=True,
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(reply)),
+    )
+    ClaudeBedrockExtractor(client).extract(JPEG_BYTES)
+    endpoint = resolve_endpoint(BedrockSettings(region="us-east-1"), {BASE_URL_ENV: base_url})
+
+    (request_url,) = sent
+    banner_url = httpx2.URL(endpoint.base_url)
+    assert endpoint.base_url == shown
+    assert (banner_url.scheme, banner_url.netloc) == (request_url.scheme, request_url.netloc)
+    assert request_url.raw_path.startswith(banner_url.raw_path.partition(b"?")[0])
 
 
 def test_endpoint_description_says_when_the_base_url_is_empty() -> None:

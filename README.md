@@ -56,8 +56,10 @@ receipts go or how requests are authenticated:
   bearer token, unless `AWS_PROFILE` is set. Even an empty value switches it.
 
 The eval prints the resolved endpoint and auth mode before anything is sent (variable names
-only, never their values; a URL's user, password and query string are masked, and a URL that
-is not `http` or `https` is not shown at all).
+only, never their values). The endpoint is parsed the way the SDK's HTTP client parses it, so
+it names the scheme, host and port requests really go to (an `@` in the path does not change
+the host); a URL's user part and query string are masked, the fragment is dropped, and a URL
+that is not a valid `http` or `https` URL with a host is not shown at all.
 
 ### Evaluate it on real receipts
 

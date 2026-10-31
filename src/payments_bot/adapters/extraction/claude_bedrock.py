@@ -8,6 +8,10 @@ amount is validated again with the domain's `parse_amount` before it is trusted.
 SDK errors become `failed` results. Configuration problems outside the SDK's typed errors (for
 example AWS credentials that cannot be resolved) propagate on purpose, so a misconfigured
 deployment fails loudly instead of marking every receipt as failed.
+
+Every text an extraction carries can be encoded as UTF-8: an answer field holding a lone
+surrogate (the JSON escape "\\ud800") is `failed`, and provider text is kept with such a
+character written as a backslash escape.
 """
 
 import base64
@@ -20,6 +24,7 @@ from functools import partial
 from typing import Any, Protocol
 
 import anthropic
+import httpx2
 
 from payments_bot.adapters.extraction.image_format import SUPPORTED_FORMATS, detect_media_type
 from payments_bot.adapters.extraction.receipt_prompt import (
@@ -227,6 +232,17 @@ class ClaudeBedrockExtractor:
                 status=ExtractionStatus.NEEDS_CONFIRMATION,
                 error=f"amount {shown} repeats the security code's digits; confirm it",
             )
+        if _has_non_digit_numeral(answer.operation_number) or _has_non_digit_numeral(
+            answer.security_code
+        ):
+            return candidate(
+                status=ExtractionStatus.NEEDS_CONFIRMATION,
+                error=(
+                    "the operation number or security code has a numeral that is not a digit "
+                    "(a circled, Roman or fraction numeral), so the amount cannot be checked "
+                    "against it; confirm the amount"
+                ),
+            )
         if confidence is not Confidence.HIGH:
             return candidate(
                 status=ExtractionStatus.NEEDS_CONFIRMATION,
@@ -252,9 +268,9 @@ class ClaudeBedrockExtractor:
         return Extraction(
             status=ExtractionStatus.FAILED,
             model=self._model,
-            error=error,
+            error=_utf8_safe(error),
             usage=usage,
-            raw_json=raw_json,
+            raw_json=None if raw_json is None else _utf8_safe(raw_json),
         )
 
 
@@ -296,6 +312,10 @@ class _ReceiptAnswer:
         confidence = data["confidence"]
         if not isinstance(confidence, str) or confidence not in set(Confidence):
             raise _SchemaMismatchError(f"confidence is not one of {', '.join(Confidence)}")
+        if any(isinstance(value, str) and not _encodable(value) for value in data.values()):
+            raise _SchemaMismatchError(
+                "a text field holds a lone surrogate, which no UTF-8 text can store"
+            )
         return cls(**data)
 
 
@@ -357,7 +377,8 @@ class BedrockEndpoint:
     """Where requests go and how they are authenticated. Holds variable names, never secrets."""
 
     base_url: str
-    """The endpoint, with any user, password or query string masked."""
+    """The endpoint as the SDK's HTTP client parses it, with any user part and query string
+    masked and the fragment dropped (see `_mask_url_secrets`)."""
     base_url_from: str | None
     """The variable that replaced the regional endpoint, or None."""
     bearer_token_from: str | None
@@ -414,23 +435,30 @@ def build_bedrock_extractor(
 
 
 def _mask_url_secrets(url: str) -> str:
-    """Hide credentials a URL may carry (user, password, query string) before printing it.
+    """The base URL as the SDK's HTTP client parses it, safe to print.
 
-    Does not rely on a URL parser: without "scheme://" a parser finds no user part, and a "/",
-    "?" or "#" inside a password ends the user part early, so the password would be printed as
-    host or path. Instead anything before the last "@" is masked, the query is masked and the
-    fragment dropped; a URL that is not http(s) is not shown at all.
+    `anthropic` parses its base URL with `httpx2.URL` (a dependency of the SDK), so the same
+    parser decides what is shown: scheme, host and port exactly as requests use them
+    (lowercase, IDNA-encoded, default port dropped), then the path. A user part becomes "***@",
+    a query "?***", and the fragment is dropped. An "@" in the path or query therefore cannot
+    move the host shown, and an "@", "/", "?" or "#" in a password cannot reveal part of it. A
+    URL the parser refuses, or that is not http(s) with a host, is not shown at all; neither is
+    the parser's error, which may quote the URL. A drift test compares the scheme, host and
+    port shown with those of a request the real client sends.
     """
     if not url:
         return url
-    scheme, separator, rest = url.partition("://")
-    if not separator or scheme.lower() not in {"http", "https"}:
-        return "(not an http or https URL, not shown)"
-    if "@" in rest:
-        rest = "***@" + rest.rpartition("@")[2]
-    rest = rest.partition("#")[0]
-    rest, query_mark, _ = rest.partition("?")
-    return f"{scheme}://{rest}{'?***' if query_mark else ''}"
+    try:
+        parsed = httpx2.URL(url)
+    except httpx2.InvalidURL:
+        return "(not a valid URL, not shown)"
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        return "(not an http or https URL with a host, not shown)"
+    user = "***@" if parsed.userinfo else ""
+    netloc = parsed.netloc.decode("ascii", "backslashreplace")
+    path = parsed.raw_path.partition(b"?")[0].decode("ascii", "backslashreplace")
+    query = "?***" if parsed.query else ""
+    return f"{parsed.scheme}://{user}{netloc}{path}{query}"
 
 
 def _check_effort(effort: str) -> None:
@@ -456,12 +484,30 @@ def _excerpt(text: str, limit: int = 40) -> str:
     return repr(text) if len(text) <= limit else f"{text[:limit]!r}... ({len(text)} characters)"
 
 
+def _encodable(text: str) -> bool:
+    """Whether `text` can be written as UTF-8; a lone surrogate ("\\ud800") cannot."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _utf8_safe(text: str) -> str:
+    """`text` with any lone surrogate written as a backslash escape ("\\ud800"), so it can be
+    stored and printed. Text without one is returned unchanged."""
+    if _encodable(text):
+        return text
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _ascii_digits(text: str | None) -> str:
     """Every digit of a printed number, as ASCII: "N° 0001-2345" -> "00012345".
 
     A digit from another script ("１", "١", "۱", "¹") becomes its ASCII digit instead of being
     dropped, which would corrupt the number ("1２345" -> "1345"). Anything that is not a single
-    digit (spaces, dashes, labels, "½") is dropped. Never raises; "" when there is no digit.
+    digit (spaces, dashes, labels, "½", "⑩") is dropped. Never raises; "" when there is no
+    digit. Callers that must not lose a numeral check `_has_non_digit_numeral` first.
     """
     if text is None:
         return ""
@@ -470,9 +516,24 @@ def _ascii_digits(text: str | None) -> str:
     )
 
 
+def _has_non_digit_numeral(text: str | None) -> bool:
+    """Whether `text` holds a character that stands for a number but not for one digit:
+    "⑩", "Ⅻ", "½", "十". Such a character is never interpreted (is "⑩" the digits 1 and 0, or
+    noise?), so neither the stored operation number nor the guards can rely on the text."""
+    if text is None:
+        return False
+    return any(
+        unicodedata.digit(char, None) is None and unicodedata.numeric(char, None) is not None
+        for char in text
+    )
+
+
 def _reference(text: str | None) -> str | None:
     """The operation number as stored: its ASCII digits, leading zeros kept. None when there
-    are no digits or more than `MAX_PRINTED_NUMBER_DIGITS` (noise)."""
+    are no digits, more than `MAX_PRINTED_NUMBER_DIGITS` (noise), or a numeral that is not a
+    digit (dropping "⑩" from "0001234⑩" would store a wrong number)."""
+    if _has_non_digit_numeral(text):
+        return None
     digits = _ascii_digits(text)
     return digits if 0 < len(digits) <= MAX_PRINTED_NUMBER_DIGITS else None
 
@@ -529,4 +590,4 @@ def _refusal_detail(response: Any) -> str:
         detail += f" (category: {stop_details.category})"
     if stop_details.explanation:
         detail += f": {stop_details.explanation}"
-    return detail
+    return _utf8_safe(detail)

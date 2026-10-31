@@ -339,6 +339,20 @@ def test_receipt_date_range_follows_the_injected_clock() -> None:
     assert extraction.paid_on == date(2026, 10, 31)
 
 
+def test_receipt_date_range_uses_the_lima_date_not_the_utc_date() -> None:
+    """At 03:00 UTC it is still 22:00 of the previous day in Lima, so "tomorrow" is the UTC
+    date: a receipt dated the day after it is a misread."""
+
+    def three_utc() -> datetime:
+        return datetime(2026, 10, 30, 3, 0, tzinfo=UTC)
+
+    after_tomorrow, _ = run(answer(paid_at="2026-10-31"), clock=three_utc)
+    tomorrow, _ = run(answer(paid_at="2026-10-30"), clock=three_utc)
+
+    assert after_tomorrow.paid_on is None
+    assert tomorrow.paid_on == date(2026, 10, 30)
+
+
 @pytest.mark.parametrize(
     "paid_at",
     ["2026-01-15T09:30:00Z", "2026-01-15T09:30:00+00:00", "2026-01-15T09:30:00-05:00"],
@@ -391,8 +405,8 @@ def test_operation_number_is_kept_as_ascii_digits(printed: str) -> None:
 
 @pytest.mark.parametrize(
     "printed",
-    ["9" * 5000, "1234567890" * 3 + "123", "N° —", "½"],
-    ids=["5000-digits", "33-digits", "no-digits", "fraction"],
+    ["9" * 5000, "1234567890" * 3 + "123", "N° —"],
+    ids=["5000-digits", "33-digits", "no-digits"],
 )
 def test_unusable_operation_number_is_dropped_without_raising(printed: str) -> None:
     extraction, _ = run(answer(operation_number=printed))
@@ -450,6 +464,38 @@ def test_amount_with_the_security_code_digits_needs_confirmation(amount: str, co
     assert extraction.amount_minor is not None
     assert extraction.error is not None
     assert "security code" in extraction.error
+
+
+@pytest.mark.parametrize(
+    ("field", "printed"),
+    [
+        ("operation_number", "0001234⑩"),
+        ("operation_number", "Ⅻ345"),
+        ("operation_number", "½"),
+        ("security_code", "9⑩"),
+        ("security_code", "Ⅻ"),
+    ],
+    ids=["circled-ten", "roman-twelve", "fraction", "code-circled-ten", "code-roman-twelve"],
+)
+def test_a_numeral_that_is_not_a_digit_in_the_printed_numbers_needs_confirmation(
+    field: str, printed: str
+) -> None:
+    """A circled ten or a Roman twelve stands for a number but not for one digit, so it is not
+    converted, and the guards cannot know which digits it hides: the amount is never trusted
+    on its own."""
+    extraction, _ = run(answer(amount="250", **{field: printed}))
+
+    assert extraction.status is ExtractionStatus.NEEDS_CONFIRMATION
+    assert extraction.amount_minor == 25000
+    assert extraction.error is not None
+    assert "not a digit" in extraction.error
+
+
+def test_an_operation_number_with_a_numeral_that_is_not_a_digit_is_not_kept() -> None:
+    """Dropping "⑩" from "0001234⑩" would leave a wrong reference."""
+    extraction, _ = run(answer(amount="250", operation_number="0001234⑩"))
+
+    assert extraction.reference is None
 
 
 # --- explicit non-ok outcomes ---------------------------------------------------------
@@ -658,6 +704,63 @@ def test_output_that_breaks_the_schema_fails(text: str) -> None:
 
     assert extraction.status is ExtractionStatus.FAILED
     assert extraction.amount_minor is None
+
+
+def utf8_encodable(text: str | None) -> bool:
+    try:
+        (text or "").encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "field", ["amount", "currency", "operation_number", "security_code", "paid_at", "provider"]
+)
+def test_a_text_field_with_a_lone_surrogate_fails(field: str) -> None:
+    """The JSON escape "\\ud800" is half of a surrogate pair: a string no UTF-8 writer can
+    encode (the results CSV, the ledger), so the answer breaks the output contract."""
+    payload = receipt_payload()
+    text = json.dumps(payload | {field: "\ud800" + (payload[field] or "")})
+
+    extraction, _ = run(message(text))
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert extraction.amount_minor is None
+    assert extraction.provider is None
+    assert extraction.raw_json == text
+
+
+def test_a_lone_surrogate_in_the_answer_text_is_kept_escaped() -> None:
+    """Every text an extraction carries stays encodable, the raw answer included."""
+    text = json.dumps(receipt_payload(provider="\ud800Yape"), ensure_ascii=False)
+
+    extraction, _ = run(message(text))
+
+    assert extraction.status is ExtractionStatus.FAILED
+    assert utf8_encodable(extraction.raw_json)
+    assert utf8_encodable(extraction.error)
+    assert extraction.raw_json is not None
+    assert "\\ud800Yape" in extraction.raw_json
+
+
+def test_provider_text_with_a_lone_surrogate_is_kept_escaped() -> None:
+    reply = message(
+        None,
+        stop_reason="refusal",
+        stop_details={"type": "refusal", "category": "cyber", "explanation": "no \ud800"},
+    )
+
+    response = httpx2.Response(400, request=FAKE_REQUEST)
+    rejected = anthropic.BadRequestError("no \udfff", response=response, body=None)
+
+    refused, _ = run(reply)
+    failed, _ = run(rejected)
+
+    assert refused.status is ExtractionStatus.REFUSED
+    assert utf8_encodable(refused.error)
+    assert failed.status is ExtractionStatus.FAILED
+    assert utf8_encodable(failed.error)
 
 
 def test_reply_without_text_fails() -> None:

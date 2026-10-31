@@ -7,6 +7,9 @@ recording a guessed amount.
 Only `ok` may be recorded without asking. `needs_confirmation` carries a candidate amount that
 the user must confirm (or correct) before anything is recorded; every other status carries no
 amount at all, so the user has to type it.
+
+Every text an extraction carries can be encoded as UTF-8: a model answer holding a lone
+surrogate is `failed`, never a value the ledger or a results file would refuse.
 """
 
 from dataclasses import dataclass
@@ -23,8 +26,10 @@ class ExtractionStatus(StrEnum):
     The only status that may be recorded without asking the user."""
     NEEDS_CONFIRMATION = "needs_confirmation"
     """A candidate amount and currency were read, but they are not trustworthy on their own (the
-    model was not highly confident, or the amount repeats the receipt's security code). Never
-    record it automatically: show it to the user and record only what they confirm."""
+    model was not highly confident, the amount repeats the receipt's security code, or the
+    operation number or security code holds a numeral that is not a digit, such as "⑩" or
+    "Ⅻ", so the amount cannot be checked against it). Never record it automatically: show it
+    to the user and record only what they confirm."""
     UNREADABLE = "unreadable"
     """It is a receipt, but no trustworthy amount and currency could be read."""
     NOT_A_RECEIPT = "not_a_receipt"
@@ -59,7 +64,8 @@ class Extraction:
     currency: str | None = None
     reference: str | None = None
     """Operation number printed on the receipt, as ASCII digits (digits of other scripts
-    converted, leading zeros kept); None when absent or implausibly long."""
+    converted, leading zeros kept); None when absent, implausibly long, or holding a numeral
+    that is not a digit ("⑩", "Ⅻ", "½")."""
     paid_on: date | None = None
     """Payment date printed on the receipt (a Lima calendar date); None when absent or not a
     plausible receipt date."""
