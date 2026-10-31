@@ -5,6 +5,7 @@ description = "Telegram bot that reads payment receipts and keeps an append-only
 requires-python = ">=3.12"
 dependencies = [
     "anthropic[bedrock]>=2.3.0",
+    "httpx2>=2.16.0",
 ]
 
 [build-system]
@@ -26,7 +27,6 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.16.0",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
 ]

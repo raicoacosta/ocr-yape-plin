@@ -292,21 +292,23 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic", extra = ["bedrock"] },
+    { name = "httpx2" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "pytest" },
     { name = "ruff" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "anthropic", extras = ["bedrock"], specifier = ">=2.3.0" }]
+requires-dist = [
+    { name = "anthropic", extras = ["bedrock"], specifier = ">=2.3.0" },
+    { name = "httpx2", specifier = ">=2.16.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = ">=2.16.0" },
     { name = "pytest", specifier = ">=9.2.0" },
     { name = "ruff", specifier = ">=0.17.3" },
 ]
