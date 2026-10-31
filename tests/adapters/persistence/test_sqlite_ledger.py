@@ -158,6 +158,33 @@ class TestPersistence:
 
         assert stored == (TS, "2026-10-28T20:30:00.000000+00:00")
 
+    @pytest.mark.parametrize(
+        ("moment", "stored_text"),
+        [
+            (datetime(1000, 1, 1, tzinfo=UTC), "1000-01-01T00:00:00.000000+00:00"),
+            (
+                datetime(9999, 12, 31, 18, 59, 59, 999999, tzinfo=LIMA),
+                "9999-12-31T23:59:59.999999+00:00",
+            ),
+        ],
+    )
+    def test_every_moment_the_domain_accepts_is_stored_and_read_back(
+        self,
+        repository: SqliteLedgerRepository,
+        raw: sqlite3.Connection,
+        moment: datetime,
+        stored_text: str,
+    ) -> None:
+        saved = repository.append(
+            payment(created_at=moment.astimezone(UTC), paid_at=moment, created_by=2**63 - 1)
+        )
+
+        assert raw.execute("SELECT created_at, paid_at FROM ledger_entries").fetchone() == (
+            stored_text,
+            stored_text,
+        )
+        assert repository.get(saved.id) == saved
+
     def test_raw_rows_in_the_stored_format_are_accepted_and_readable(
         self, repository: SqliteLedgerRepository, raw: sqlite3.Connection
     ) -> None:
@@ -535,6 +562,8 @@ class TestRowsTheDomainCouldNotReadAreRefused:
             ),
             pytest.param({"reason": ""}, "reason_not_blank", id="payment-reason-empty"),
             pytest.param({"reason": " \t\u3000\n"}, "reason_not_blank", id="payment-reason-blank"),
+            pytest.param({"created_by": 0}, "created_by_positive", id="created-by-zero"),
+            pytest.param({"created_by": -1}, "created_by_positive", id="created-by-negative"),
         ],
     )
     def test_payment_row(
@@ -606,23 +635,24 @@ class TestRowsTheDomainCouldNotReadAreRefused:
 
 class TestSchemaVersion:
     def test_new_database_records_the_schema_version(self, raw: sqlite3.Connection) -> None:
-        assert SCHEMA_VERSION == 2
+        assert SCHEMA_VERSION == 3
         assert raw.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
 
+    @pytest.mark.parametrize("version", [1, 2])
     def test_database_from_an_older_version_is_refused_and_left_untouched(
-        self, tmp_path: Path
+        self, tmp_path: Path, version: int
     ) -> None:
         older = tmp_path / "older.db"
         connection = sqlite3.connect(older)
         connection.execute("CREATE TABLE ledger_entries (id INTEGER PRIMARY KEY)")
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+        connection.execute(f"PRAGMA user_version = {version}")
         connection.close()
 
-        with pytest.raises(UnsupportedSchemaError, match=f"version {SCHEMA_VERSION - 1};"):
+        with pytest.raises(UnsupportedSchemaError, match=f"version {version};"):
             SqliteLedgerRepository(older)
 
         connection = sqlite3.connect(older)
-        assert connection.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION - 1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (version,)
         assert connection.execute("SELECT name FROM sqlite_master").fetchall() == [
             ("ledger_entries",)
         ]

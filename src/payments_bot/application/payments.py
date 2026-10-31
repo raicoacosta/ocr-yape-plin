@@ -76,6 +76,6 @@ class RegisterPayment:
 
 
 def _blank_to_none(text: str | None) -> str | None:
-    if text is None or not text.strip():
-        return None
-    return text.strip()
+    if not isinstance(text, str):
+        return text  # None stays None; anything else is the entry's to refuse
+    return text.strip() or None

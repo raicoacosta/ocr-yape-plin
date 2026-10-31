@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -8,7 +8,7 @@ from payments_bot.adapters.persistence.sqlite_ledger import SqliteLedgerReposito
 from payments_bot.application.clock import Clock
 from payments_bot.application.errors import DuplicateImageError
 from payments_bot.application.payments import PaymentRegistered, RegisterPayment
-from payments_bot.domain.errors import InvalidAmountError, InvalidEntryError
+from payments_bot.domain.errors import DomainError, InvalidAmountError, InvalidEntryError
 from payments_bot.domain.ledger import EntryKind, EntrySource
 from payments_bot.domain.money import MAX_AMOUNT_MINOR
 
@@ -145,5 +145,41 @@ def test_registration_is_undone_when_a_later_step_fails(
         RegisterPayment(_FailingBalance(repository), clock).execute(
             amount_minor=4000, source=EntrySource.OCR, created_by=1
         )
+
+    assert repository.history(limit=10) == []
+
+
+_PLUS_FIVE = timezone(timedelta(hours=5))
+_LIMA = timezone(timedelta(hours=-5))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"paid_at": datetime(999, 1, 1, tzinfo=UTC)}, id="paid_at-year-999"),
+        pytest.param(
+            {"paid_at": datetime(1, 1, 1, 1, tzinfo=_PLUS_FIVE)}, id="paid_at-before-min-in-utc"
+        ),
+        pytest.param(
+            {"paid_at": datetime(9999, 12, 31, 23, 59, tzinfo=_LIMA)}, id="paid_at-after-max-in-utc"
+        ),
+        pytest.param({"created_by": 2**63}, id="created_by-above-int64"),
+        pytest.param({"created_by": 0}, id="created_by-zero"),
+        pytest.param({"created_by": "7"}, id="created_by-digit-text"),
+        pytest.param({"created_by": "abc"}, id="created_by-text"),
+        pytest.param({"created_by": 1.5}, id="created_by-float"),
+        pytest.param({"created_by": None}, id="created_by-none"),
+        pytest.param({"image_sha256": b"c" * 64}, id="image_sha256-bytes"),
+        pytest.param({"currency": 123}, id="currency-int"),
+        pytest.param({"reference": 123}, id="reference-int"),
+        pytest.param({"image_key": 123}, id="image_key-int"),
+    ],
+)
+def test_values_storage_cannot_hold_are_refused_as_domain_errors(
+    repository: SqliteLedgerRepository, register: Register, overrides: dict[str, Any]
+) -> None:
+    # Never a raw sqlite3 error, OverflowError, TypeError or AttributeError from storage.
+    with pytest.raises(DomainError):
+        register(**overrides)
 
     assert repository.history(limit=10) == []

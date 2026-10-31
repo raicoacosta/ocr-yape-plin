@@ -7,19 +7,28 @@ original payment, like an accounting counter-entry.
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from payments_bot.domain.errors import (
     AlreadyVoidedError,
     CurrencyMismatchError,
     InvalidAmountError,
+    InvalidCurrencyError,
     InvalidEntryError,
     MissingReasonError,
     NoChangeError,
     NotAPaymentError,
 )
 from payments_bot.domain.money import DEFAULT_CURRENCY, MAX_AMOUNT_MINOR, validate_currency
+
+MAX_ENTRY_ID = 2**63 - 1
+"""Largest entry id the ledger can hold (a 64-bit signed integer); ids start at 1."""
+MAX_USER_ID = 2**63 - 1
+"""Largest `created_by` the ledger can hold; user ids (Telegram's) start at 1."""
+EARLIEST_STORABLE_YEAR = 1000
+LATEST_STORABLE_YEAR = 9999
+"""Timestamps are stored as UTC text with a four-digit year that cannot start with 0."""
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _FREE_TEXT_FIELDS = ("reason", "reference", "image_key", "extracted_json")
@@ -98,6 +107,10 @@ def build_correction(
     if payment.id is None:
         raise InvalidEntryError("a payment must be persisted before it can be corrected")
     clean_reason = _require_reason(reason)
+    if isinstance(new_amount_minor, bool) or not isinstance(new_amount_minor, int):
+        raise InvalidAmountError(
+            f"a corrected amount must be integer minor units: {new_amount_minor!r}"
+        )
     if new_amount_minor < 0:
         raise InvalidAmountError(f"a corrected amount cannot be negative: {new_amount_minor}")
     if new_amount_minor > MAX_AMOUNT_MINOR:
@@ -149,6 +162,7 @@ def balance(entries: Iterable[Entry]) -> dict[str, int]:
 
 
 def _validate_common(entry: Entry) -> None:
+    """Everything here must also be storable: a domain-valid entry never fails in storage."""
     if not isinstance(entry.kind, EntryKind) or not isinstance(entry.source, EntrySource):
         raise InvalidEntryError("kind and source must be EntryKind and EntrySource members")
     if isinstance(entry.amount_minor, bool) or not isinstance(entry.amount_minor, int):
@@ -157,15 +171,50 @@ def _validate_common(entry: Entry) -> None:
         raise InvalidAmountError(
             f"amount exceeds {MAX_AMOUNT_MINOR} minor units: {entry.amount_minor}"
         )
+    if not isinstance(entry.currency, str):
+        raise InvalidCurrencyError(f"not an ISO 4217 currency code: {entry.currency!r}")
     validate_currency(entry.currency)
+    _validate_positive_int("created_by", entry.created_by, MAX_USER_ID)
+    if entry.id is not None:
+        _validate_positive_int("id", entry.id, MAX_ENTRY_ID)
+    if entry.corrects_id is not None:
+        _validate_positive_int("corrects_id", entry.corrects_id, MAX_ENTRY_ID)
+    _validate_moment("created_at", entry.created_at)
     if entry.created_at.utcoffset() != timedelta(0):
         raise InvalidEntryError("created_at must be a timezone-aware UTC datetime")
-    if entry.paid_at is not None and entry.paid_at.utcoffset() is None:
-        raise InvalidEntryError("paid_at must be timezone-aware")
-    if entry.image_sha256 is not None and not _SHA256_HEX.fullmatch(entry.image_sha256):
+    if entry.paid_at is not None:
+        _validate_moment("paid_at", entry.paid_at)
+    if entry.image_sha256 is not None and (
+        not isinstance(entry.image_sha256, str) or not _SHA256_HEX.fullmatch(entry.image_sha256)
+    ):
         raise InvalidEntryError("image_sha256 must be 64 lowercase hex characters")
     for field in _FREE_TEXT_FIELDS:
         _validate_text(field, getattr(entry, field))
+
+
+def _validate_positive_int(field: str, value: object, maximum: int) -> None:
+    """An int (never a bool, a float or digit text) from 1 to `maximum`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidEntryError(f"{field} must be an int: {value!r}")
+    if not 1 <= value <= maximum:
+        raise InvalidEntryError(f"{field} must be between 1 and {maximum}: {value}")
+
+
+def _validate_moment(field: str, value: object) -> None:
+    """A timezone-aware datetime whose UTC instant falls in the years storage can hold."""
+    if not isinstance(value, datetime):
+        raise InvalidEntryError(f"{field} must be a datetime: {value!r}")
+    if value.utcoffset() is None:
+        raise InvalidEntryError(f"{field} must be timezone-aware")
+    try:
+        year = value.astimezone(UTC).year
+    except OverflowError:  # the UTC instant is before year 1 or after year 9999
+        year = None
+    if year is None or not EARLIEST_STORABLE_YEAR <= year <= LATEST_STORABLE_YEAR:
+        raise InvalidEntryError(
+            f"{field} must fall in the years {EARLIEST_STORABLE_YEAR} to "
+            f"{LATEST_STORABLE_YEAR} in UTC: {value.isoformat()}"
+        )
 
 
 def _validate_text(field: str, value: str | None) -> None:
@@ -209,6 +258,8 @@ def _require_payment(entry: Entry) -> None:
 
 
 def _require_reason(reason: str | None) -> str:
+    if reason is not None and not isinstance(reason, str):
+        raise InvalidEntryError(f"reason must be text: {reason!r}")
     if reason is None or not reason.strip():
         raise MissingReasonError("a correction needs a non-blank reason")
     return reason.strip()

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -27,6 +27,7 @@ from payments_bot.domain.money import MAX_AMOUNT_MINOR
 
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
 LIMA = timezone(-timedelta(hours=5))
+PLUS_FIVE = timezone(timedelta(hours=5))
 USER_ID = 1001
 IMAGE_HASH = "a" * 64
 
@@ -154,6 +155,94 @@ class TestEntryInvariants:
         with pytest.raises(InvalidEntryError):
             make_payment(paid_at=datetime(2026, 10, 28, 20, 30))
 
+    @pytest.mark.parametrize(
+        "paid_at",
+        [
+            pytest.param(datetime(999, 12, 31, 23, 0, tzinfo=UTC), id="year-999"),
+            pytest.param(datetime(1000, 1, 1, 1, 0, tzinfo=PLUS_FIVE), id="year-999-in-utc"),
+            pytest.param(datetime(1, 1, 1, 1, 0, tzinfo=PLUS_FIVE), id="before-datetime-min"),
+            pytest.param(datetime(9999, 12, 31, 23, 59, tzinfo=LIMA), id="after-datetime-max"),
+            pytest.param(datetime.min.replace(tzinfo=UTC), id="datetime-min"),
+        ],
+    )
+    def test_paid_at_must_fall_in_years_1000_to_9999_in_utc(self, paid_at: datetime) -> None:
+        # Storage writes the UTC instant with a four-digit year that cannot start with 0.
+        with pytest.raises(InvalidEntryError, match="paid_at"):
+            make_payment(paid_at=paid_at)
+
+    @pytest.mark.parametrize(
+        "paid_at",
+        [
+            datetime(1000, 1, 1, tzinfo=UTC),
+            datetime(1000, 1, 1, 0, 0, tzinfo=LIMA),
+            datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+            datetime(9999, 12, 31, 18, 59, 59, 999999, tzinfo=LIMA),
+        ],
+    )
+    def test_paid_at_may_reach_both_ends_of_the_storable_years(self, paid_at: datetime) -> None:
+        assert make_payment(paid_at=paid_at).paid_at == paid_at
+
+    @pytest.mark.parametrize(
+        "created_at",
+        [datetime(999, 12, 31, 23, 59, tzinfo=UTC), datetime.min.replace(tzinfo=UTC)],
+    )
+    def test_created_at_must_fall_in_years_1000_to_9999(self, created_at: datetime) -> None:
+        with pytest.raises(InvalidEntryError, match="created_at"):
+            make_payment(created_at=created_at)
+
+    @pytest.mark.parametrize("field", ["created_at", "paid_at"])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("2026-10-29T15:00:00+00:00", id="text"),
+            pytest.param(1761750000, id="number"),
+            pytest.param(date(2026, 10, 29), id="date"),
+        ],
+    )
+    def test_timestamps_must_be_datetimes(self, field: str, value: object) -> None:
+        with pytest.raises(InvalidEntryError, match=field):
+            make_payment(**{field: value})
+
+    @pytest.mark.parametrize(
+        "created_by",
+        [0, -1, 2**63, True, 1.5, "7", "abc", None],
+        ids=["zero", "negative", "above-int64", "bool", "float", "digit-text", "text", "none"],
+    )
+    def test_created_by_must_be_a_positive_64_bit_int(self, created_by: object) -> None:
+        with pytest.raises(InvalidEntryError, match="created_by"):
+            make_payment(created_by=created_by)
+
+    @pytest.mark.parametrize("created_by", [1, 2**63 - 1])
+    def test_created_by_may_reach_both_ends_of_the_range(self, created_by: int) -> None:
+        assert make_payment(created_by=created_by).created_by == created_by
+
+    @pytest.mark.parametrize("value", [0, -1, 2**63, True, 1.0, "1"])
+    def test_ids_must_be_positive_64_bit_ints(self, value: object) -> None:
+        with pytest.raises(InvalidEntryError, match="^id "):
+            make_payment(id=value)
+        with pytest.raises(InvalidEntryError, match="^corrects_id "):
+            make_adjustment(-500, corrects_id=value)
+
+    def test_ids_may_reach_the_largest_64_bit_int(self) -> None:
+        assert make_payment(id=2**63 - 1).id == 2**63 - 1
+        assert make_adjustment(-500, corrects_id=2**63 - 1).corrects_id == 2**63 - 1
+
+    @pytest.mark.parametrize(
+        "field", ["reason", "reference", "image_key", "extracted_json", "image_sha256"]
+    )
+    @pytest.mark.parametrize(
+        "value", [pytest.param(123, id="int"), pytest.param(b"a" * 64, id="bytes")]
+    )
+    def test_text_fields_refuse_values_that_are_not_str(self, field: str, value: object) -> None:
+        # A domain error, never a TypeError: every rule violation is a `DomainError`.
+        with pytest.raises(InvalidEntryError, match=field):
+            make_payment(**{field: value})
+
+    @pytest.mark.parametrize("currency", [123, b"PEN", None])
+    def test_currency_that_is_not_str_is_refused_as_a_currency(self, currency: object) -> None:
+        with pytest.raises(InvalidCurrencyError):
+            make_payment(currency=currency)
+
     @pytest.mark.parametrize("image_sha256", ["abc", "A" * 64, "g" * 64])
     def test_image_hash_must_be_lowercase_sha256_hex(self, image_sha256: str) -> None:
         with pytest.raises(InvalidEntryError):
@@ -269,6 +358,18 @@ class TestBuildCorrection:
     def test_rejects_blank_reason(self, reason: str) -> None:
         with pytest.raises(MissingReasonError):
             correct(make_payment(25000), [], 30000, reason)
+
+    @pytest.mark.parametrize("reason", [123, b"typo"])
+    def test_rejects_a_reason_that_is_not_text(self, reason: Any) -> None:
+        with pytest.raises(InvalidEntryError, match="reason"):
+            correct(make_payment(25000), [], 30000, reason)
+
+    @pytest.mark.parametrize("new_amount_minor", [True, 1.5, 30000.0, "30000"])
+    def test_rejects_a_new_amount_that_is_not_integer_minor_units(
+        self, new_amount_minor: Any
+    ) -> None:
+        with pytest.raises(InvalidAmountError):
+            correct(make_payment(25000), [], new_amount_minor, "typo")
 
     def test_rejects_adjustment_as_target(self) -> None:
         target = make_adjustment(-500, id=2)

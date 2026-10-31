@@ -1,13 +1,11 @@
 from dataclasses import dataclass
 
 from payments_bot.application.errors import EntryNotFoundError
-from payments_bot.domain.ledger import Entry, effective_amount
+from payments_bot.domain.ledger import MAX_ENTRY_ID, Entry, effective_amount
 from payments_bot.ports.ledger_repository import LedgerRepository
 
 MAX_HISTORY_PAGE = 500
 """Most entries `ListHistory` returns at once; a larger page is refused, not truncated."""
-MAX_ENTRY_ID = 2**63 - 1
-"""Largest id the ledger can assign (SQLite's 64-bit INTEGER); no entry has a larger one."""
 
 
 @dataclass(frozen=True, slots=True)

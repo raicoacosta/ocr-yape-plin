@@ -7,8 +7,9 @@ take its payment's effective amount below zero or above `MAX_AMOUNT_MINOR`.
 
 Rows can never be deleted, so a row the domain refuses to load would break `history()` for
 good. The CHECK constraints therefore mirror the domain: ISO 4217 currency, lowercase
-SHA-256 hex, non-blank reasons, bounded amounts, positive ids, no NUL character in any text,
-and timestamps in exactly the UTC text format this adapter writes. Text that is not valid
+SHA-256 hex, non-blank reasons, bounded amounts, positive ids and `created_by`, no NUL
+character in any text, and timestamps in exactly the UTC text format this adapter writes
+(years 1000 to 9999, which the domain enforces before any write). Text that is not valid
 UTF-8 (raw bytes CAST to TEXT, which SQLite stores unchecked) is read with replacement
 characters instead of failing to decode.
 
@@ -34,11 +35,12 @@ from payments_bot.domain.money import MAX_AMOUNT_MINOR
 from payments_bot.ports.ledger_repository import ImageAlreadyStoredError, LedgerBusyError
 
 IN_MEMORY = ":memory:"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Stored in `PRAGMA user_version`; bump it, and migrate from the previous one, on change.
 
-Version 2 made the text checks NUL-safe and bounded the effective amount above. No version 1
-ledger was ever put to use, so there is no migration from it: it is refused like any other.
+Version 2 made the text checks NUL-safe and bounded the effective amount above; version 3
+requires a positive `created_by`. No version 1 or 2 ledger was ever put to use, so there is
+no migration from them: they are refused like any other.
 """
 BUSY_TIMEOUT_SECONDS = 5.0
 """How long a writer waits for a concurrent unit of work to finish before giving up."""
@@ -101,7 +103,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     currency       TEXT    NOT NULL CONSTRAINT currency_iso_4217
                    CHECK (currency GLOB '[A-Z][A-Z][A-Z]' AND {_no_nul("currency")}),
     source         TEXT    NOT NULL CHECK (source IN ('ocr', 'manual', 'import')),
-    created_by     INTEGER NOT NULL,
+    created_by     INTEGER NOT NULL CONSTRAINT created_by_positive CHECK (created_by > 0),
     created_at     TEXT    NOT NULL CONSTRAINT created_at_utc_text
                    CHECK ({_utc_text("created_at")}),
     corrects_id    INTEGER REFERENCES ledger_entries (id),

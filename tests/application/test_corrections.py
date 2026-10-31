@@ -11,6 +11,7 @@ from payments_bot.application.payments import PaymentRegistered
 from payments_bot.domain.errors import (
     AlreadyVoidedError,
     InvalidAmountError,
+    InvalidEntryError,
     NoChangeError,
     NotAPaymentError,
 )
@@ -174,5 +175,23 @@ def test_adjustment_is_undone_when_a_later_step_fails(
             )
         else:
             VoidEntry(failing, clock).execute(entry_id=payment.id, reason="x", created_by=FIXER_ID)
+
+    assert repository.history(limit=10) == [payment]
+
+
+@pytest.mark.parametrize("created_by", [2**63, 0, "3003", None])
+def test_a_correction_by_an_id_storage_cannot_hold_is_refused_and_writes_nothing(
+    repository: SqliteLedgerRepository, clock: Clock, register: Register, created_by: Any
+) -> None:
+    payment = register(amount_minor=25000).entry
+
+    with pytest.raises(InvalidEntryError, match="created_by"):
+        CorrectEntry(repository, clock).execute(
+            entry_id=payment.id, new_amount_minor=20000, reason="typo", created_by=created_by
+        )
+    with pytest.raises(InvalidEntryError, match="created_by"):
+        VoidEntry(repository, clock).execute(
+            entry_id=payment.id, reason="typo", created_by=created_by
+        )
 
     assert repository.history(limit=10) == [payment]
