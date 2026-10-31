@@ -18,10 +18,13 @@ commits on its own and `atomic()` wraps a unit of work in BEGIN IMMEDIATE ... CO
 writer waits up to the busy timeout for another one; past it, the port's `LedgerBusyError`
 is raised instead of SQLite's "database is locked".
 
-The schema version lives in `PRAGMA user_version`; a database from a newer version, or one
-created before versioning, is refused instead of being read with the wrong assumptions.
+The schema version lives in `PRAGMA user_version`; a database from a newer version, one
+created before versioning, or another application's file is refused instead of being read
+with the wrong assumptions, and is left exactly as it was: nothing is written to a file
+before it is known to be this ledger, or empty.
 """
 
+import math
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -48,6 +51,14 @@ _OPEN_RETRY_PAUSE_SECONDS = 0.02
 """Pause between attempts to prepare a database file another connection is preparing too."""
 _BUSY_ERROR_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_MAX_BUSY_TIMEOUT_MS = 2**31 - 1
+"""SQLite keeps its busy timeout in a C int of milliseconds (about 24.8 days)."""
+_SCHEMA_STATE = (
+    "SELECT (SELECT user_version FROM pragma_user_version) AS version,"
+    " (SELECT count(*) FROM sqlite_master) AS objects,"
+    " EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'ledger_entries') AS has_ledger"
+)
+"""Version and contents read in one statement, so concurrent openers see one snapshot."""
 
 
 class UnsupportedSchemaError(RuntimeError):
@@ -223,10 +234,15 @@ class SqliteLedgerRepository:
     """`LedgerRepository` backed by SQLite. It exposes no update or delete operation."""
 
     def __init__(self, database: str | Path, *, busy_timeout: float = BUSY_TIMEOUT_SECONDS) -> None:
+        if not math.isfinite(busy_timeout) or busy_timeout < 0:
+            raise ValueError(
+                f"busy_timeout must be a finite number of seconds >= 0: {busy_timeout}"
+            )
         self._busy_timeout = busy_timeout
         # autocommit=True: the driver never opens or commits transactions behind our back
         # (unlike isolation_level=None, executescript() then also respects an open one).
-        self._connection = sqlite3.connect(database, autocommit=True, timeout=busy_timeout)
+        # The busy timeout is set by _prepare, per attempt, and then for good.
+        self._connection = sqlite3.connect(database, autocommit=True, timeout=0)
         self._connection.row_factory = sqlite3.Row
         self._connection.text_factory = _decode_text
         try:
@@ -308,25 +324,31 @@ class SqliteLedgerRepository:
         )
 
     def _prepare(self, *, wal: bool) -> None:
-        """Switch to WAL and create or check the schema, waiting out other openers.
+        """Check the schema, switch to WAL and create the schema, waiting out other openers.
 
         Switching the journal mode does not wait on the busy timeout: while another
         connection holds a lock, SQLite answers "database is locked" at once (it would risk a
         deadlock otherwise), so processes opening a new file together used to fail. Retry
-        the whole preparation until the busy timeout has passed, then give up.
+        the whole preparation until the busy timeout has passed, then give up. An attempt
+        can also wait inside SQLite's busy handler, so each one may only wait for the time
+        left: the whole open takes about the busy timeout, never twice as long.
         """
         deadline = monotonic() + self._busy_timeout
         while True:
+            self._set_busy_timeout(min(self._busy_timeout, max(0.0, deadline - monotonic())))
             try:
                 with self._busy_as_ledger_error():
-                    if wal:
-                        self._connection.execute("PRAGMA journal_mode = WAL")
-                    self._ensure_schema()
-                return
+                    self._open_schema(wal=wal)
+                break
             except LedgerBusyError:
                 if monotonic() >= deadline:
                     raise
                 sleep(_OPEN_RETRY_PAUSE_SECONDS)
+        self._set_busy_timeout(self._busy_timeout)
+
+    def _set_busy_timeout(self, seconds: float) -> None:
+        milliseconds = min(int(seconds * 1000), _MAX_BUSY_TIMEOUT_MS)
+        self._connection.execute(f"PRAGMA busy_timeout = {milliseconds}")
 
     @contextmanager
     def _busy_as_ledger_error(self) -> Iterator[None]:
@@ -341,38 +363,50 @@ class SqliteLedgerRepository:
                 f"(busy timeout {self._busy_timeout} s): {error}"
             ) from error
 
-    def _ensure_schema(self) -> None:
-        """Create the schema in a new database; refuse one this code cannot read safely."""
-        if self._schema_version() == SCHEMA_VERSION:
+    def _open_schema(self, *, wal: bool) -> None:
+        """Use this ledger, or create it in an empty file; refuse anything else untouched.
+
+        The file is checked before anything is written: switching to WAL rewrites its header,
+        so a refused file would otherwise be left changed for good.
+        """
+        is_new = self._is_empty_or_refuse()
+        if wal:
+            self._connection.execute("PRAGMA journal_mode = WAL")
+        if not is_new:
             return
         with self.atomic():
-            version = self._schema_version()  # again, now that no one else can write
-            if version == SCHEMA_VERSION:
+            # Again, now that no one else can write: another opener may have created it.
+            if not self._is_empty_or_refuse():
                 return
-            if version > SCHEMA_VERSION:
-                raise UnsupportedSchemaError(
-                    f"ledger database has schema version {version}; "
-                    f"this code supports up to {SCHEMA_VERSION}"
-                )
-            # A future version N migrates from N - 1 here; no older version migrates today.
-            if version != 0:
-                raise UnsupportedSchemaError(
-                    f"ledger database has schema version {version}; "
-                    f"this code needs {SCHEMA_VERSION} and cannot migrate from it"
-                )
-            # Version 0 is a brand-new file, unless it already holds a ledger.
-            if self._connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = 'ledger_entries'"
-            ).fetchone():
-                raise UnsupportedSchemaError(
-                    "ledger database has no schema version: it predates versioning "
-                    "and cannot be migrated"
-                )
             self._connection.executescript(_SCHEMA)
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
-    def _schema_version(self) -> int:
-        return self._rows("PRAGMA user_version")[0][0]
+    def _is_empty_or_refuse(self) -> bool:
+        """False for this schema version, True for an empty file; refuse anything else."""
+        version, objects, has_ledger = self._rows(_SCHEMA_STATE)[0]
+        if version == SCHEMA_VERSION:
+            return False
+        if version > SCHEMA_VERSION:
+            raise UnsupportedSchemaError(
+                f"ledger database has schema version {version}; "
+                f"this code supports up to {SCHEMA_VERSION}"
+            )
+        # A future version N migrates from N - 1 here; no older version migrates today.
+        if version != 0:
+            raise UnsupportedSchemaError(
+                f"ledger database has schema version {version}; "
+                f"this code needs {SCHEMA_VERSION} and cannot migrate from it"
+            )
+        if has_ledger:
+            raise UnsupportedSchemaError(
+                "ledger database has no schema version: it predates versioning "
+                "and cannot be migrated"
+            )
+        if objects:
+            raise UnsupportedSchemaError(
+                "database is not a ledger: it is not empty and has no ledger schema version"
+            )
+        return True
 
     def _image_owner(self, entry: Entry) -> int | None:
         """Id of the stored entry that already carries `entry`'s image hash, if any."""

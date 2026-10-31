@@ -122,3 +122,39 @@ def test_entry_ids_must_be_ints(
 
     with pytest.raises(TypeError):
         GetEntryDetail(repository).execute(entry_id)
+
+
+def test_a_history_page_holds_at_most_500_entries(
+    repository: SqliteLedgerRepository, register: Register
+) -> None:
+    # The documented maximum, pinned as a literal rather than through the constant.
+    register()
+
+    assert len(ListHistory(repository).execute(limit=500)) == 1
+    with pytest.raises(ValueError):
+        ListHistory(repository).execute(limit=501)
+
+
+class _NoHistory:
+    """A repository that must never be asked for history."""
+
+    def history(self, limit: int, before_id: int | None = None) -> list[Any]:
+        raise AssertionError(f"invalid paging reached the repository: {limit}, {before_id}")
+
+
+@pytest.mark.parametrize(
+    ("limit", "before_id", "error"),
+    [
+        (501, None, ValueError),
+        (True, None, TypeError),
+        (10, 0, ValueError),
+        (10, MAX_ENTRY_ID + 1, ValueError),
+        (10, True, TypeError),
+        (10, 2.0, TypeError),
+    ],
+)
+def test_list_history_checks_paging_before_asking_the_repository(
+    limit: Any, before_id: Any, error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        ListHistory(_NoHistory()).execute(limit=limit, before_id=before_id)
